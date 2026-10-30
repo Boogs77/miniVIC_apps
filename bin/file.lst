@@ -1,0 +1,3849 @@
+Sections:
+00: "segfd0" (FD0-FD1)
+01: "seg1000" (1000-2626)
+
+
+Source: "apps\file.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   FILE  -  miniVIC FILE, card file (PFS:File style)          ;
+                        	     4: ;   65C02 assembly, TMS9918A text mode 40 x 24                 ;
+                        	     5: ;   Needs the BIOS 27.10.26 KEYB/SD                            ;
+                        	     6: ;                                                              ;
+                        	     7: ;   - a form of up to 8 fields (name 10 chars, width 1-28);    ;
+                        	     8: ;     at the start an address book form, ^KN designs another   ;
+                        	     9: ;   - one card on the screen: arrows / Tab change field,       ;
+                        	    10: ;     typing overwrites, PgUp PgDn change card, F3 new card,   ;
+                        	    11: ;     F8 deletes it; F2 the list (one card per row)            ;
+                        	    12: ;   - F4 find (any field, any case), F5 find again, F6 sort    ;
+                        	    13: ;     by the field under the cursor (Shell sort of the order   ;
+                        	    14: ;     table, the cards themselves do not move)                 ;
+                        	    15: ;   - ^KS save, ^KA save as, ^KO open, ^KN new file, ^KX save  ;
+                        	    16: ;     and exit, ^KQ quit: SD document of type 3                ;
+                        	    17: ;                                                              ;
+                        	    18: ;   MEMORY                                                     ;
+                        	    19: ;   $0050-$009F  zero page (lib $A0-$EB)                       ;
+                        	    20: ;   $0210-$029F  form: names, widths, offsets; name; find      ;
+                        	    21: ;   $0600-$07FF  SD document index                             ;
+                        	    22: ;   $0800-$09FF  sector buffer (lib/stream)                    ;
+                        	    23: ;   $1000-...    code                                          ;
+                        	    24: ;   $3000-$30FF  order of the cards (slot numbers)             ;
+                        	    25: ;   $3100-$7FFF  cards: slot * record size (20224 bytes)       ;
+                        	    26: ;                                                              ;
+                        	    27: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    28: 
+                        	    29:  .include "lib/system.inc"
+
+Source: "lib\system.inc"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   SYSTEM.INC  -  miniVIC / BO6502 addresses for the apps     ;
+                        	     4: ;   BIOS 27.10.26 KEYB/SD jump table, VDP, key codes           ;
+                        	     5: ;                                                              ;
+                        	     6: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     7: 
+                        	     8: ; ---------------- BIOS jump table ($FD00) ----------------
+                        	     9: JT_CHROUT       = $FD00    ; A = char to screen AND serial (not used by the apps)
+                        	    10: JT_CHRIN        = $FD03    ; C=1 and A = key, C=0 no key (serial first, then keyboard)
+                        	    11: JT_INIT_CRT     = $FD09    ; text mode, VRAM and font of the BIOS
+                        	    12: JT_SHOW_MENU    = $FD0F    ; back to the BIOS menu (never returns)
+                        	    13: JT_SD_READ      = $FD18    ; sector SD_LBA -> buffer X/Y (lo/hi, 512 bytes), C=1 error
+                        	    14: JT_SD_WRITE     = $FD1B    ; buffer X/Y -> sector SD_LBA, C=1 error
+                        	    15: JT_SD_INIT      = $FD1E    ; C=0 and A = card type, C=1 no card
+                        	    16: JT_KB_MODE      = $FD21    ; A<>0 extended keyboard, A=0 classic
+                        	    17: SD_LBA          = $0316    ; 4 bytes, sector number, little endian
+                        	    18: 
+                        	    19: ; ---------------- RAM vectors (everything is polled) ----------------
+                        	    20: IRQ_VEC         = $0FA0    ; JSR $0FA0 from the BIOS IRQ handler
+                        	    21: NMI_VEC         = $0FD0    ; JSR $0FD0 from the BIOS NMI handler
+                        	    22: 
+                        	    23: ; ---------------- VDP TMS9918A ----------------
+                        	    24: VDP_DATA        = $B000
+                        	    25: VDP_REG         = $B001
+                        	    26: VRAM_NAME       = $0800    ; name table of the BIOS text mode (40 x 24)
+                        	    27: VRAM_FONT       = $0000    ; patterns 0-127 (BIOS font), 128-255 = inverse (made by VT_INIT)
+                        	    28: 
+                        	    29: ; ---------------- serial W65C51 ----------------
+                        	    30: ACIA_DATA   = $C000
+                        	    31: ACIA_STATUS = $C001    ; bit 3 = byte received
+                        	    32: ACIA_CMD    = $C002    ; BIOS: $8B (no parity, receive IRQ off, DTR on)
+                        	    33: ACIA_CTRL   = $C003    ; BIOS: $1F (19200, 8 bits, 1 stop)
+                        	    34: 
+                        	    35: ; ---------------- key codes (extended mode) ----------------
+                        	    36: K_CR            = $0D
+                        	    37: K_BS            = $08
+                        	    38: K_TAB           = $09
+                        	    39: K_ESC           = $1B
+                        	    40: K_UP            = $80
+                        	    41: K_DOWN          = $81
+                        	    42: K_LEFT          = $82
+                        	    43: K_RIGHT         = $83
+                        	    44: K_HOME          = $84
+                        	    45: K_END           = $85
+                        	    46: K_PGUP          = $86
+                        	    47: K_PGDN          = $87
+                        	    48: K_INS           = $88
+                        	    49: K_DEL           = $89
+                        	    50: K_F1            = $90      ; F1-F12 = $90-$9B
+                        	    51: 
+
+Source: "apps\file.asm"
+                        	    30: 
+                        	    31: ; ---------------- parameters ----------------
+                        	    32: MAXF        = 8        ; fields
+                        	    33: NAMEW       = 10       ; field name
+                        	    34: MAXW        = 28       ; field width
+                        	    35: ORDER       = $3000
+                        	    36: DATA        = $3100
+                        	    37: DATA_END    = $8000
+                        	    38: MAXSLOTS    = 250
+                        	    39: NAMELEN     = 12
+                        	    40: FINDMAX     = 20
+                        	    41: LROWS       = 20       ; list rows (screen rows 2-21)
+                        	    42: 
+                        	    43: ; ---------------- zero page ----------------
+                        	    44: NF          = $50      ; fields
+                        	    45: RS          = $51      ; record size
+                        	    46: NREC        = $52      ; cards
+                        	    47: CUR         = $53      ; card shown (position in ORDER)
+                        	    48: FLD         = $54      ; field under the cursor
+                        	    49: FPOS        = $55      ; cursor in the field
+                        	    50: MODF        = $56
+                        	    51: MAXREC      = $57
+                        	    52: MSGP        = $58      ; 2 bytes
+                        	    53: PREFIX      = $5A
+                        	    54: RP          = $5B      ; 2 bytes: card
+                        	    55: T0          = $5D
+                        	    56: T1          = $5E
+                        	    57: T2          = $5F
+                        	    58: T3          = $60
+                        	    59: P0          = $61      ; 2 bytes
+                        	    60: P1          = $63      ; 2 bytes
+                        	    61: FLEN        = $65
+                        	    62: DOCSLOT     = $66
+                        	    63: ROWI        = $67
+                        	    64: LTOP        = $68      ; list: first row, selected card
+                        	    65: LSEL        = $69
+                        	    66: GAP         = $6A      ; sort
+                        	    67: SI          = $6B
+                        	    68: SJ          = $6C
+                        	    69: STMP        = $6D
+                        	    70: GI          = $6E
+                        	    71: SFLD        = $6F
+                        	    72: COLS        = $70      ; list: columns left in the row
+                        	    73: SPT         = $71      ; SLOTPTR
+                        	    74: 
+                        	    75: ; ---------------- RAM ----------------
+                        	    76: FNAME       = $0210    ; 8 x 10: field names
+                        	    77: FWID        = $0260    ; 8 widths
+                        	    78: FOFF        = $0268    ; 8 offsets in the card
+                        	    79: DOCNAME     = $0270    ; 12 + $00
+                        	    80: FINDBUF     = $0280    ; find string (upper case, 20 + $00)
+                        	    81: FORMBAK     = $0900    ; copy of the form while a new one is typed (in the sector buffer)
+                        	    82: 
+                        	    83:  .org $0FD0
+00:0FD0 60              	    84:   RTS                    ; NMI trampoline (the VDP interrupt is off)
+                        	    85:  .org $1000
+                        	    86: 
+                        	    87: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; start and main loop
+                        	    88: 
+                        	    89: RESET:
+01:1000 78              	    90:   SEI
+01:1001 D8              	    91:   CLD
+01:1002 A2FF            	    92:   LDX #$FF
+01:1004 9A              	    93:   TXS
+01:1005 A960            	    94:   LDA #$60
+01:1007 8DA00F          	    95:   STA IRQ_VEC
+01:100A 20BD1F          	    96:   JSR VT_INIT
+01:100D 20331F          	    97:   JSR KB_INIT
+01:1010 A903            	    98:   LDA #3                 ; type 3 = card file
+01:1012 85B8            	    99:   STA DOC_T
+01:1014 6465            	   100:   STZ FLEN
+01:1016 645A            	   101:   STZ PREFIX
+01:1018 A257            	   102:   LDX #DEFFORM_L-1       ; the address book form
+                        	   103: .rs_f:
+01:101A BDD21A          	   104:   LDA DEFFORM,X
+01:101D 9D1002          	   105:   STA FNAME,X
+01:1020 CA              	   106:   DEX
+01:1021 10F7            	   107:   BPL .rs_f
+01:1023 A907            	   108:   LDA #DEFNF
+01:1025 8550            	   109:   STA NF
+01:1027 20A210          	   110:   JSR FORMSET
+01:102A 20D510          	   111:   JSR FILENEW
+01:102D A92F            	   112:   LDA #<M_HELLO
+01:102F A21B            	   113:   LDX #>M_HELLO
+01:1031 205C13          	   114:   JSR SETMSG
+                        	   115: MAIN:
+01:1034 20CB11          	   116:   JSR DRAWCARD
+01:1037 203C13          	   117:   JSR MSGLINE
+                        	   118: IDLE:
+01:103A 20901F          	   119:   JSR GETKEY
+01:103D 90FB            	   120:   BCC IDLE
+                        	   121: .mn_k:
+01:103F 204C10          	   122:   JSR DOKEY
+01:1042 20B11F          	   123:   JSR KEYREADY
+01:1045 90ED            	   124:   BCC MAIN
+01:1047 20901F          	   125:   JSR GETKEY
+01:104A 80F3            	   126:   BRA .mn_k
+                        	   127: 
+                        	   128: ; DOKEY: key A
+                        	   129: DOKEY:
+01:104C 6459            	   130:   STZ MSGP+1
+01:104E A65A            	   131:   LDX PREFIX
+01:1050 F029            	   132:   BEQ .dk_n
+01:1052 645A            	   133:   STZ PREFIX
+01:1054 205223          	   134:   JSR UI_UPC
+01:1057 C91B            	   135:   CMP #$1B               ; (Ctrl+letter as the letter)
+01:1059 B002            	   136:   BCS .dk_kl
+01:105B 0940            	   137:   ORA #$40
+                        	   138: .dk_kl:
+01:105D A200            	   139:   LDX #0
+                        	   140: .dk_kt:
+01:105F BCBC1A          	   141:   LDY KTAB,X
+01:1062 F037            	   142:   BEQ .dk_x
+01:1064 DDBC1A          	   143:   CMP KTAB,X
+01:1067 F005            	   144:   BEQ .dk_kg
+01:1069 E8              	   145:   INX
+01:106A E8              	   146:   INX
+01:106B E8              	   147:   INX
+01:106C 80F1            	   148:   BRA .dk_kt
+                        	   149: .dk_kg:
+01:106E BDBD1A          	   150:   LDA KTAB+1,X
+01:1071 8561            	   151:   STA P0
+01:1073 BDBE1A          	   152:   LDA KTAB+2,X
+01:1076 8562            	   153:   STA P0+1
+01:1078 6C6100          	   154:   JMP (P0)
+                        	   155: .dk_n:
+01:107B C920            	   156:   CMP #' '
+01:107D 9007            	   157:   BCC .dk_c
+01:107F C97F            	   158:   CMP #$7F
+01:1081 B008            	   159:   BCS .dk_e
+01:1083 4C7A13          	   160:   JMP TYPECH
+                        	   161: .dk_c:
+01:1086 0A              	   162:   ASL
+01:1087 AA              	   163:   TAX
+01:1088 7C441A          	   164:   JMP (CTRLTAB,X)
+                        	   165: .dk_e:
+01:108B C980            	   166:   CMP #K_UP
+01:108D 900C            	   167:   BCC .dk_x
+01:108F C99C            	   168:   CMP #K_F1+12
+01:1091 B008            	   169:   BCS .dk_x
+01:1093 38              	   170:   SEC
+01:1094 E980            	   171:   SBC #K_UP
+01:1096 0A              	   172:   ASL
+01:1097 AA              	   173:   TAX
+01:1098 7C841A          	   174:   JMP (EXTTAB,X)
+                        	   175: .dk_x:
+01:109B 60              	   176:   RTS
+                        	   177: 
+                        	   178: NOP_CMD:
+01:109C 60              	   179:   RTS
+                        	   180: 
+                        	   181: CMD_PFXK:
+01:109D A94B            	   182:   LDA #'K'
+01:109F 855A            	   183:   STA PREFIX
+01:10A1 60              	   184:   RTS
+                        	   185: 
+                        	   186: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; form and cards
+                        	   187: 
+                        	   188: ; FORMSET: offsets, record size, how many cards fit
+                        	   189: FORMSET:
+01:10A2 A200            	   190:   LDX #0
+01:10A4 A900            	   191:   LDA #0
+                        	   192: .fs_l:
+01:10A6 9D6802          	   193:   STA FOFF,X
+01:10A9 18              	   194:   CLC
+01:10AA 7D6002          	   195:   ADC FWID,X
+01:10AD E8              	   196:   INX
+01:10AE E450            	   197:   CPX NF
+01:10B0 D0F4            	   198:   BNE .fs_l
+01:10B2 8551            	   199:   STA RS
+01:10B4 A900            	   200:   LDA #<(DATA_END-DATA)  ; MAXREC = space / RS (250 at most)
+01:10B6 8561            	   201:   STA P0
+01:10B8 A94F            	   202:   LDA #>(DATA_END-DATA)
+01:10BA 8562            	   203:   STA P0+1
+01:10BC A200            	   204:   LDX #0
+                        	   205: .fs_m:
+01:10BE 38              	   206:   SEC
+01:10BF A561            	   207:   LDA P0
+01:10C1 E551            	   208:   SBC RS
+01:10C3 8561            	   209:   STA P0
+01:10C5 A562            	   210:   LDA P0+1
+01:10C7 E900            	   211:   SBC #0
+01:10C9 8562            	   212:   STA P0+1
+01:10CB 9005            	   213:   BCC .fs_x
+01:10CD E8              	   214:   INX
+01:10CE E0FA            	   215:   CPX #MAXSLOTS
+01:10D0 D0EC            	   216:   BNE .fs_m
+                        	   217: .fs_x:
+01:10D2 8657            	   218:   STX MAXREC
+01:10D4 60              	   219:   RTS
+                        	   220: 
+                        	   221: ; FILENEW: no cards but one blank, no name
+                        	   222: FILENEW:
+01:10D5 6452            	   223:   STZ NREC
+01:10D7 6453            	   224:   STZ CUR
+01:10D9 6454            	   225:   STZ FLD
+01:10DB 6455            	   226:   STZ FPOS
+01:10DD 6466            	   227:   STZ DOCSLOT
+01:10DF A20C            	   228:   LDX #NAMELEN
+                        	   229: .fn_n:
+01:10E1 9E7002          	   230:   STZ DOCNAME,X
+01:10E4 CA              	   231:   DEX
+01:10E5 10FA            	   232:   BPL .fn_n
+01:10E7 202111          	   233:   JSR ADDREC
+01:10EA 6456            	   234:   STZ MODF
+01:10EC 60              	   235:   RTS
+                        	   236: 
+                        	   237: ; SLOTPTR: RP = DATA + A * RS
+                        	   238: SLOTPTR:
+01:10ED 8571            	   239:   STA SPT
+01:10EF 645B            	   240:   STZ RP
+01:10F1 645C            	   241:   STZ RP+1
+01:10F3 A208            	   242:   LDX #8
+                        	   243: .sp_l:
+01:10F5 065B            	   244:   ASL RP
+01:10F7 265C            	   245:   ROL RP+1
+01:10F9 0671            	   246:   ASL SPT
+01:10FB 900B            	   247:   BCC .sp_n
+01:10FD 18              	   248:   CLC
+01:10FE A55B            	   249:   LDA RP
+01:1100 6551            	   250:   ADC RS
+01:1102 855B            	   251:   STA RP
+01:1104 9002            	   252:   BCC .sp_n
+01:1106 E65C            	   253:   INC RP+1
+                        	   254: .sp_n:
+01:1108 CA              	   255:   DEX
+01:1109 D0EA            	   256:   BNE .sp_l
+01:110B 18              	   257:   CLC
+01:110C A55B            	   258:   LDA RP
+01:110E 6900            	   259:   ADC #<DATA
+01:1110 855B            	   260:   STA RP
+01:1112 A55C            	   261:   LDA RP+1
+01:1114 6931            	   262:   ADC #>DATA
+01:1116 855C            	   263:   STA RP+1
+01:1118 60              	   264:   RTS
+                        	   265: 
+                        	   266: ; CURPTR: RP = card shown
+                        	   267: CURPTR:
+01:1119 A653            	   268:   LDX CUR
+01:111B BD0030          	   269:   LDA ORDER,X
+01:111E 4CED10          	   270:   JMP SLOTPTR
+                        	   271: 
+                        	   272: ; ADDREC: a blank card after the one shown (or the first). C=1 full
+                        	   273: ADDREC:
+01:1121 A552            	   274:   LDA NREC
+01:1123 C557            	   275:   CMP MAXREC
+01:1125 9009            	   276:   BCC .ar_ok
+01:1127 A91A            	   277:   LDA #<M_FULL
+01:1129 A21C            	   278:   LDX #>M_FULL
+01:112B 205C13          	   279:   JSR SETMSG
+01:112E 38              	   280:   SEC
+01:112F 60              	   281:   RTS
+                        	   282: .ar_ok:
+01:1130 A552            	   283:   LDA NREC               ; where it goes in the order
+01:1132 F003            	   284:   BEQ .ar_p
+01:1134 A553            	   285:   LDA CUR
+01:1136 1A              	   286:   INC A
+                        	   287: .ar_p:
+01:1137 855E            	   288:   STA T1
+01:1139 A652            	   289:   LDX NREC               ; move the order up from there
+                        	   290: .ar_m:
+01:113B E45E            	   291:   CPX T1
+01:113D F009            	   292:   BEQ .ar_s
+01:113F BDFF2F          	   293:   LDA ORDER-1,X
+01:1142 9D0030          	   294:   STA ORDER,X
+01:1145 CA              	   295:   DEX
+01:1146 80F3            	   296:   BRA .ar_m
+                        	   297: .ar_s:
+01:1148 A552            	   298:   LDA NREC               ; its slot is the first free one: NREC
+01:114A 9D0030          	   299:   STA ORDER,X
+01:114D 20ED10          	   300:   JSR SLOTPTR
+01:1150 A451            	   301:   LDY RS
+01:1152 A920            	   302:   LDA #' '
+                        	   303: .ar_b:
+01:1154 88              	   304:   DEY
+01:1155 915B            	   305:   STA (RP),Y
+01:1157 D0FB            	   306:   BNE .ar_b
+01:1159 E652            	   307:   INC NREC
+01:115B A55E            	   308:   LDA T1
+01:115D 8553            	   309:   STA CUR
+01:115F 6454            	   310:   STZ FLD
+01:1161 6455            	   311:   STZ FPOS
+01:1163 A901            	   312:   LDA #1
+01:1165 8556            	   313:   STA MODF
+01:1167 18              	   314:   CLC
+01:1168 60              	   315:   RTS
+                        	   316: 
+                        	   317: ; DELREC: deletes the card shown; the last slot moves into its place
+                        	   318: DELREC:
+01:1169 A653            	   319:   LDX CUR
+01:116B BD0030          	   320:   LDA ORDER,X
+01:116E 855F            	   321:   STA T2                 ; its slot
+                        	   322: .dr_m:
+01:1170 BD0130          	   323:   LDA ORDER+1,X          ; order down from CUR
+01:1173 9D0030          	   324:   STA ORDER,X
+01:1176 E8              	   325:   INX
+01:1177 E452            	   326:   CPX NREC
+01:1179 90F5            	   327:   BCC .dr_m
+01:117B C652            	   328:   DEC NREC
+01:117D A55F            	   329:   LDA T2
+01:117F C552            	   330:   CMP NREC
+01:1181 F02E            	   331:   BEQ .dr_d              ; it was the last slot
+01:1183 A552            	   332:   LDA NREC               ; card of the last slot -> slot T2
+01:1185 20ED10          	   333:   JSR SLOTPTR
+01:1188 A55B            	   334:   LDA RP
+01:118A 8561            	   335:   STA P0
+01:118C A55C            	   336:   LDA RP+1
+01:118E 8562            	   337:   STA P0+1
+01:1190 A55F            	   338:   LDA T2
+01:1192 20ED10          	   339:   JSR SLOTPTR
+01:1195 A000            	   340:   LDY #0
+                        	   341: .dr_c:
+01:1197 B161            	   342:   LDA (P0),Y
+01:1199 915B            	   343:   STA (RP),Y
+01:119B C8              	   344:   INY
+01:119C C451            	   345:   CPY RS
+01:119E D0F7            	   346:   BNE .dr_c
+01:11A0 A200            	   347:   LDX #0                 ; and the order points to its new slot
+                        	   348: .dr_f:
+01:11A2 BD0030          	   349:   LDA ORDER,X
+01:11A5 C552            	   350:   CMP NREC
+01:11A7 F003            	   351:   BEQ .dr_o
+01:11A9 E8              	   352:   INX
+01:11AA 80F6            	   353:   BRA .dr_f
+                        	   354: .dr_o:
+01:11AC A55F            	   355:   LDA T2
+01:11AE 9D0030          	   356:   STA ORDER,X
+                        	   357: .dr_d:
+01:11B1 A901            	   358:   LDA #1
+01:11B3 8556            	   359:   STA MODF
+01:11B5 A552            	   360:   LDA NREC
+01:11B7 D004            	   361:   BNE .dr_c2
+01:11B9 202111          	   362:   JSR ADDREC             ; never without a card
+01:11BC 60              	   363:   RTS
+                        	   364: .dr_c2:
+01:11BD A553            	   365:   LDA CUR
+01:11BF C552            	   366:   CMP NREC
+01:11C1 9005            	   367:   BCC .dr_x
+01:11C3 A552            	   368:   LDA NREC
+01:11C5 3A              	   369:   DEC A
+01:11C6 8553            	   370:   STA CUR
+                        	   371: .dr_x:
+01:11C8 6455            	   372:   STZ FPOS
+01:11CA 60              	   373:   RTS
+                        	   374: 
+                        	   375: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; card screen
+                        	   376: 
+                        	   377: ; DRAWCARD: status, the fields of the card, the hint
+                        	   378: DRAWCARD:
+01:11CB 209112          	   379:   JSR STATUS
+01:11CE A901            	   380:   LDA #1
+01:11D0 203820          	   381:   JSR VT_ROW
+01:11D3 A920            	   382:   LDA #' '
+01:11D5 A228            	   383:   LDX #40
+01:11D7 205720          	   384:   JSR VT_REP
+01:11DA 201911          	   385:   JSR CURPTR
+01:11DD 6467            	   386:   STZ ROWI
+                        	   387: .dc_r:
+01:11DF A567            	   388:   LDA ROWI               ; screen rows 2, 4, 6 ...: field ROWI
+01:11E1 0A              	   389:   ASL
+01:11E2 18              	   390:   CLC
+01:11E3 6902            	   391:   ADC #2
+01:11E5 203820          	   392:   JSR VT_ROW
+01:11E8 A567            	   393:   LDA ROWI
+01:11EA C550            	   394:   CMP NF
+01:11EC 9009            	   395:   BCC .dc_f
+01:11EE A920            	   396:   LDA #' '               ; no field: two blank rows
+01:11F0 A250            	   397:   LDX #80
+01:11F2 205720          	   398:   JSR VT_REP
+01:11F5 8052            	   399:   BRA .dc_n
+                        	   400: .dc_f:
+01:11F7 207B12          	   401:   JSR FNAMEP             ; name (10) and ": "
+01:11FA A000            	   402:   LDY #0
+                        	   403: .dc_nm:
+01:11FC B161            	   404:   LDA (P0),Y
+01:11FE 8D00B0          	   405:   STA VDP_DATA
+01:1201 C8              	   406:   INY
+01:1202 C00A            	   407:   CPY #NAMEW
+01:1204 D0F6            	   408:   BNE .dc_nm
+01:1206 A93A            	   409:   LDA #':'
+01:1208 8D00B0          	   410:   STA VDP_DATA
+01:120B A920            	   411:   LDA #' '
+01:120D 8D00B0          	   412:   STA VDP_DATA
+01:1210 A667            	   413:   LDX ROWI
+01:1212 BD6802          	   414:   LDA FOFF,X
+01:1215 A8              	   415:   TAY
+01:1216 BD6002          	   416:   LDA FWID,X
+01:1219 855E            	   417:   STA T1
+01:121B 645D            	   418:   STZ T0                 ; character of the field
+                        	   419: .dc_v:
+01:121D B15B            	   420:   LDA (RP),Y
+01:121F A667            	   421:   LDX ROWI
+01:1221 E454            	   422:   CPX FLD
+01:1223 D00A            	   423:   BNE .dc_o
+01:1225 0980            	   424:   ORA #$80               ; field under the cursor: inverse,
+01:1227 A65D            	   425:   LDX T0
+01:1229 E455            	   426:   CPX FPOS
+01:122B D002            	   427:   BNE .dc_o
+01:122D 4980            	   428:   EOR #$80               ; the cursor itself normal
+                        	   429: .dc_o:
+01:122F 8D00B0          	   430:   STA VDP_DATA
+01:1232 C8              	   431:   INY
+01:1233 E65D            	   432:   INC T0
+01:1235 A55D            	   433:   LDA T0
+01:1237 C55E            	   434:   CMP T1
+01:1239 D0E2            	   435:   BNE .dc_v
+01:123B A91C            	   436:   LDA #40-NAMEW-2        ; rest of the row and the blank row
+01:123D 38              	   437:   SEC
+01:123E E55E            	   438:   SBC T1
+01:1240 18              	   439:   CLC
+01:1241 6928            	   440:   ADC #40
+01:1243 AA              	   441:   TAX
+01:1244 A920            	   442:   LDA #' '
+01:1246 205720          	   443:   JSR VT_REP
+                        	   444: .dc_n:
+01:1249 E667            	   445:   INC ROWI
+01:124B A567            	   446:   LDA ROWI
+01:124D C908            	   447:   CMP #MAXF
+01:124F D08E            	   448:   BNE .dc_r
+01:1251 A912            	   449:   LDA #18
+01:1253 203820          	   450:   JSR VT_ROW
+01:1256 A920            	   451:   LDA #' '
+01:1258 A278            	   452:   LDX #120
+01:125A 205720          	   453:   JSR VT_REP
+01:125D A915            	   454:   LDA #21
+01:125F 203820          	   455:   JSR VT_ROW
+01:1262 64A4            	   456:   STZ VT_INV
+01:1264 A9A5            	   457:   LDA #<M_KEYS
+01:1266 A21B            	   458:   LDX #>M_KEYS
+01:1268 A000            	   459:   LDY #0
+01:126A 208320          	   460:   JSR VT_LINE
+01:126D A916            	   461:   LDA #22
+01:126F 203820          	   462:   JSR VT_ROW
+01:1272 A9CD            	   463:   LDA #<M_KEYS2
+01:1274 A21B            	   464:   LDX #>M_KEYS2
+01:1276 A000            	   465:   LDY #0
+01:1278 4C8320          	   466:   JMP VT_LINE
+                        	   467: 
+                        	   468: ; FNAMEP: P0 = name of field ROWI
+                        	   469: FNAMEP:
+01:127B A567            	   470:   LDA ROWI
+01:127D 0A              	   471:   ASL                    ; * 10 = * 8 + * 2
+01:127E 855D            	   472:   STA T0
+01:1280 0A              	   473:   ASL
+01:1281 0A              	   474:   ASL
+01:1282 18              	   475:   CLC
+01:1283 655D            	   476:   ADC T0
+01:1285 18              	   477:   CLC
+01:1286 6910            	   478:   ADC #<FNAME
+01:1288 8561            	   479:   STA P0
+01:128A A902            	   480:   LDA #>FNAME
+01:128C 6900            	   481:   ADC #0
+01:128E 8562            	   482:   STA P0+1
+01:1290 60              	   483:   RTS
+                        	   484: 
+                        	   485: ; STATUS: row 0: file name, *, card n / cards, cards that still fit
+                        	   486: STATUS:
+01:1291 A227            	   487:   LDX #39
+01:1293 A920            	   488:   LDA #' '
+                        	   489: .st_b:
+01:1295 9DA002          	   490:   STA UI_LINE,X
+01:1298 CA              	   491:   DEX
+01:1299 10FA            	   492:   BPL .st_b
+01:129B A200            	   493:   LDX #0
+                        	   494: .st_n:
+01:129D BD7002          	   495:   LDA DOCNAME,X
+01:12A0 F008            	   496:   BEQ .st_nn
+01:12A2 9DA102          	   497:   STA UI_LINE+1,X
+01:12A5 E8              	   498:   INX
+01:12A6 E00C            	   499:   CPX #NAMELEN
+01:12A8 D0F3            	   500:   BNE .st_n
+                        	   501: .st_nn:
+01:12AA E000            	   502:   CPX #0
+01:12AC D00B            	   503:   BNE .st_m
+01:12AE A206            	   504:   LDX #6
+                        	   505: .st_no:
+01:12B0 BDA71C          	   506:   LDA M_NONAME,X
+01:12B3 9DA102          	   507:   STA UI_LINE+1,X
+01:12B6 CA              	   508:   DEX
+01:12B7 10F7            	   509:   BPL .st_no
+                        	   510: .st_m:
+01:12B9 A556            	   511:   LDA MODF
+01:12BB F005            	   512:   BEQ .st_c
+01:12BD A92A            	   513:   LDA #'*'
+01:12BF 8DAD02          	   514:   STA UI_LINE+13
+                        	   515: .st_c:
+01:12C2 A203            	   516:   LDX #3
+                        	   517: .st_cl:
+01:12C4 BDAE1C          	   518:   LDA M_CARD,X
+01:12C7 9DAF02          	   519:   STA UI_LINE+15,X
+01:12CA CA              	   520:   DEX
+01:12CB 10F7            	   521:   BPL .st_cl
+01:12CD A9A0            	   522:   LDA #<UI_LINE
+01:12CF 85A2            	   523:   STA VT_P
+01:12D1 A902            	   524:   LDA #>UI_LINE
+01:12D3 85A3            	   525:   STA VT_P+1
+01:12D5 A553            	   526:   LDA CUR                ; "CARD" 15-18, number 19-23, "/" 24, cards 25-29
+01:12D7 1A              	   527:   INC A
+01:12D8 85A5            	   528:   STA NUM
+01:12DA 64A6            	   529:   STZ NUM+1
+01:12DC A013            	   530:   LDY #19
+01:12DE 201221          	   531:   JSR NUMSTR
+01:12E1 A92F            	   532:   LDA #'/'
+01:12E3 8DB802          	   533:   STA UI_LINE+24
+01:12E6 A552            	   534:   LDA NREC
+01:12E8 85A5            	   535:   STA NUM
+01:12EA 64A6            	   536:   STZ NUM+1
+01:12EC A019            	   537:   LDY #25
+01:12EE 201221          	   538:   JSR NUMSTR
+01:12F1 A55A            	   539:   LDA PREFIX
+01:12F3 F008            	   540:   BEQ .st_f
+01:12F5 8DBF02          	   541:   STA UI_LINE+31
+01:12F8 A95E            	   542:   LDA #'^'
+01:12FA 8DBE02          	   543:   STA UI_LINE+30
+                        	   544: .st_f:
+01:12FD 38              	   545:   SEC                    ; cards that still fit
+01:12FE A557            	   546:   LDA MAXREC
+01:1300 E552            	   547:   SBC NREC
+01:1302 85A5            	   548:   STA NUM
+01:1304 64A6            	   549:   STZ NUM+1
+01:1306 A020            	   550:   LDY #32                ; (32-36; a prefix shows over its first digits)
+01:1308 201221          	   551:   JSR NUMSTR
+01:130B A55A            	   552:   LDA PREFIX
+01:130D F00D            	   553:   BEQ .st_f2
+01:130F 8DBF02          	   554:   STA UI_LINE+31
+01:1312 A95E            	   555:   LDA #'^'
+01:1314 8DBE02          	   556:   STA UI_LINE+30
+01:1317 A920            	   557:   LDA #' '
+01:1319 8DC002          	   558:   STA UI_LINE+32
+                        	   559: .st_f2:
+01:131C A202            	   560:   LDX #2
+                        	   561: .st_fl:
+01:131E BDB21C          	   562:   LDA M_FREE,X
+01:1321 9DC502          	   563:   STA UI_LINE+37,X
+01:1324 CA              	   564:   DEX
+01:1325 10F7            	   565:   BPL .st_fl
+01:1327 A900            	   566:   LDA #0
+01:1329 203820          	   567:   JSR VT_ROW
+01:132C A200            	   568:   LDX #0
+                        	   569: .st_o:
+01:132E BDA002          	   570:   LDA UI_LINE,X
+01:1331 0980            	   571:   ORA #$80
+01:1333 8D00B0          	   572:   STA VDP_DATA
+01:1336 E8              	   573:   INX
+01:1337 E028            	   574:   CPX #40
+01:1339 D0F3            	   575:   BNE .st_o
+01:133B 60              	   576:   RTS
+                        	   577: 
+                        	   578: ; MSGLINE: row 23: prefix hint, message or the default hint
+                        	   579: MSGLINE:
+01:133C A917            	   580:   LDA #23
+01:133E 203820          	   581:   JSR VT_ROW
+01:1341 64A4            	   582:   STZ VT_INV
+01:1343 A55A            	   583:   LDA PREFIX
+01:1345 F006            	   584:   BEQ .ml_m
+01:1347 A97B            	   585:   LDA #<M_HK
+01:1349 A21B            	   586:   LDX #>M_HK
+01:134B 800A            	   587:   BRA .ml_o
+                        	   588: .ml_m:
+01:134D A558            	   589:   LDA MSGP
+01:134F A659            	   590:   LDX MSGP+1
+01:1351 D004            	   591:   BNE .ml_o
+01:1353 A954            	   592:   LDA #<M_HINT
+01:1355 A21B            	   593:   LDX #>M_HINT
+                        	   594: .ml_o:
+01:1357 A000            	   595:   LDY #0
+01:1359 4C8320          	   596:   JMP VT_LINE
+                        	   597: 
+                        	   598: SETMSG:
+01:135C 8558            	   599:   STA MSGP
+01:135E 8659            	   600:   STX MSGP+1
+01:1360 60              	   601:   RTS
+                        	   602: 
+                        	   603: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; editing
+                        	   604: 
+                        	   605: ; FLDPTR: P0 = field FLD of the card shown, T1 = its width
+                        	   606: FLDPTR:
+01:1361 201911          	   607:   JSR CURPTR
+01:1364 A654            	   608:   LDX FLD
+01:1366 18              	   609:   CLC
+01:1367 A55B            	   610:   LDA RP
+01:1369 7D6802          	   611:   ADC FOFF,X
+01:136C 8561            	   612:   STA P0
+01:136E A55C            	   613:   LDA RP+1
+01:1370 6900            	   614:   ADC #0
+01:1372 8562            	   615:   STA P0+1
+01:1374 BD6002          	   616:   LDA FWID,X
+01:1377 855E            	   617:   STA T1
+01:1379 60              	   618:   RTS
+                        	   619: 
+                        	   620: TYPECH:
+01:137A 48              	   621:   PHA
+01:137B 206113          	   622:   JSR FLDPTR
+01:137E 68              	   623:   PLA
+01:137F A455            	   624:   LDY FPOS
+01:1381 9161            	   625:   STA (P0),Y
+01:1383 C8              	   626:   INY
+01:1384 C45E            	   627:   CPY T1
+01:1386 B002            	   628:   BCS .tc_m
+01:1388 8455            	   629:   STY FPOS
+                        	   630: .tc_m:
+01:138A A901            	   631:   LDA #1
+01:138C 8556            	   632:   STA MODF
+01:138E 60              	   633:   RTS
+                        	   634: 
+                        	   635: CMD_BKSP:
+01:138F A555            	   636:   LDA FPOS
+01:1391 F005            	   637:   BEQ .bk_x
+01:1393 C655            	   638:   DEC FPOS
+01:1395 4C9913          	   639:   JMP CMD_DEL
+                        	   640: .bk_x:
+01:1398 60              	   641:   RTS
+                        	   642: 
+                        	   643: CMD_DEL:
+01:1399 206113          	   644:   JSR FLDPTR             ; the rest of the field moves left
+01:139C A455            	   645:   LDY FPOS
+                        	   646: .de_l:
+01:139E C8              	   647:   INY
+01:139F C45E            	   648:   CPY T1
+01:13A1 B008            	   649:   BCS .de_e
+01:13A3 B161            	   650:   LDA (P0),Y
+01:13A5 88              	   651:   DEY
+01:13A6 9161            	   652:   STA (P0),Y
+01:13A8 C8              	   653:   INY
+01:13A9 80F3            	   654:   BRA .de_l
+                        	   655: .de_e:
+01:13AB 88              	   656:   DEY
+01:13AC A920            	   657:   LDA #' '
+01:13AE 9161            	   658:   STA (P0),Y
+01:13B0 A901            	   659:   LDA #1
+01:13B2 8556            	   660:   STA MODF
+01:13B4 60              	   661:   RTS
+                        	   662: 
+                        	   663: CMD_LEFT:
+01:13B5 A555            	   664:   LDA FPOS
+01:13B7 F002            	   665:   BEQ .lf_x
+01:13B9 C655            	   666:   DEC FPOS
+                        	   667: .lf_x:
+01:13BB 60              	   668:   RTS
+                        	   669: 
+                        	   670: CMD_RIGHT:
+01:13BC 206113          	   671:   JSR FLDPTR
+01:13BF A555            	   672:   LDA FPOS
+01:13C1 1A              	   673:   INC A
+01:13C2 C55E            	   674:   CMP T1
+01:13C4 B002            	   675:   BCS .rt_x
+01:13C6 8555            	   676:   STA FPOS
+                        	   677: .rt_x:
+01:13C8 60              	   678:   RTS
+                        	   679: 
+                        	   680: CMD_HOME:
+01:13C9 6455            	   681:   STZ FPOS
+01:13CB 60              	   682:   RTS
+                        	   683: 
+                        	   684: CMD_END:
+01:13CC 206113          	   685:   JSR FLDPTR             ; after the last character that is not a space
+01:13CF A45E            	   686:   LDY T1
+                        	   687: .en_l:
+01:13D1 88              	   688:   DEY
+01:13D2 3006            	   689:   BMI .en_z
+01:13D4 B161            	   690:   LDA (P0),Y
+01:13D6 C920            	   691:   CMP #' '
+01:13D8 F0F7            	   692:   BEQ .en_l
+                        	   693: .en_z:
+01:13DA C8              	   694:   INY
+01:13DB C45E            	   695:   CPY T1
+01:13DD 9003            	   696:   BCC .en_s
+01:13DF A45E            	   697:   LDY T1
+01:13E1 88              	   698:   DEY
+                        	   699: .en_s:
+01:13E2 8455            	   700:   STY FPOS
+01:13E4 60              	   701:   RTS
+                        	   702: 
+                        	   703: CMD_UP:
+01:13E5 6455            	   704:   STZ FPOS
+01:13E7 A554            	   705:   LDA FLD
+01:13E9 D002            	   706:   BNE .up_d
+01:13EB A550            	   707:   LDA NF
+                        	   708: .up_d:
+01:13ED 3A              	   709:   DEC A
+01:13EE 8554            	   710:   STA FLD
+01:13F0 60              	   711:   RTS
+                        	   712: 
+                        	   713: CMD_DOWN:
+01:13F1 6455            	   714:   STZ FPOS
+01:13F3 A554            	   715:   LDA FLD
+01:13F5 1A              	   716:   INC A
+01:13F6 C550            	   717:   CMP NF
+01:13F8 9002            	   718:   BCC .dn_s
+01:13FA A900            	   719:   LDA #0
+                        	   720: .dn_s:
+01:13FC 8554            	   721:   STA FLD
+01:13FE 60              	   722:   RTS
+                        	   723: 
+                        	   724: CMD_PGUP:
+01:13FF A553            	   725:   LDA CUR
+01:1401 F004            	   726:   BEQ .pu_x
+01:1403 C653            	   727:   DEC CUR
+01:1405 6455            	   728:   STZ FPOS
+                        	   729: .pu_x:
+01:1407 60              	   730:   RTS
+                        	   731: 
+                        	   732: CMD_PGDN:
+01:1408 A553            	   733:   LDA CUR
+01:140A 1A              	   734:   INC A
+01:140B C552            	   735:   CMP NREC
+01:140D B004            	   736:   BCS .pd_x
+01:140F 8553            	   737:   STA CUR
+01:1411 6455            	   738:   STZ FPOS
+                        	   739: .pd_x:
+01:1413 60              	   740:   RTS
+                        	   741: 
+                        	   742: CMD_FIRST:
+01:1414 6453            	   743:   STZ CUR
+01:1416 6455            	   744:   STZ FPOS
+01:1418 60              	   745:   RTS
+                        	   746: 
+                        	   747: CMD_LAST:
+01:1419 A552            	   748:   LDA NREC
+01:141B 3A              	   749:   DEC A
+01:141C 8553            	   750:   STA CUR
+01:141E 6455            	   751:   STZ FPOS
+01:1420 60              	   752:   RTS
+                        	   753: 
+                        	   754: CMD_NEWREC:
+01:1421 4C2111          	   755:   JMP ADDREC
+                        	   756: 
+                        	   757: CMD_DELREC:
+01:1424 A90B            	   758:   LDA #<Q_DELREC
+01:1426 A21D            	   759:   LDX #>Q_DELREC
+01:1428 205D23          	   760:   JSR YESNO
+01:142B B003            	   761:   BCS .dl_x
+01:142D 4C6911          	   762:   JMP DELREC
+                        	   763: .dl_x:
+01:1430 60              	   764:   RTS
+                        	   765: 
+                        	   766: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; find and sort
+                        	   767: 
+                        	   768: CMD_FIND:
+01:1431 A214            	   769:   LDX #FINDMAX           ; the last string is offered
+                        	   770: .fd_c:
+01:1433 BD8002          	   771:   LDA FINDBUF,X
+01:1436 9DD802          	   772:   STA UI_BUF,X
+01:1439 CA              	   773:   DEX
+01:143A 10F7            	   774:   BPL .fd_c
+01:143C A665            	   775:   LDX FLEN
+01:143E 9ED802          	   776:   STZ UI_BUF,X
+01:1441 A914            	   777:   LDA #FINDMAX
+01:1443 85B2            	   778:   STA UI_PMAX
+01:1445 A901            	   779:   LDA #1
+01:1447 85B3            	   780:   STA UI_PUPC
+01:1449 A9B5            	   781:   LDA #<P_FIND
+01:144B A21C            	   782:   LDX #>P_FIND
+01:144D 20C622          	   783:   JSR PROMPT
+01:1450 B00F            	   784:   BCS .fd_x
+01:1452 8565            	   785:   STA FLEN
+01:1454 AA              	   786:   TAX
+                        	   787: .fd_s:
+01:1455 BDD802          	   788:   LDA UI_BUF,X
+01:1458 9D8002          	   789:   STA FINDBUF,X
+01:145B CA              	   790:   DEX
+01:145C 10F7            	   791:   BPL .fd_s
+01:145E 4C6214          	   792:   JMP CMD_FINDAG
+                        	   793: .fd_x:
+01:1461 60              	   794:   RTS
+                        	   795: 
+                        	   796: ; CMD_FINDAG: the next card (after the one shown, then from the first) holding FINDBUF
+                        	   797: CMD_FINDAG:
+01:1462 A565            	   798:   LDA FLEN
+01:1464 F031            	   799:   BEQ .fa_x
+01:1466 A553            	   800:   LDA CUR
+01:1468 856E            	   801:   STA GI
+                        	   802: .fa_l:
+01:146A E66E            	   803:   INC GI                 ; next position, around the end
+01:146C A56E            	   804:   LDA GI
+01:146E C552            	   805:   CMP NREC
+01:1470 9002            	   806:   BCC .fa_t
+01:1472 646E            	   807:   STZ GI
+                        	   808: .fa_t:
+01:1474 A66E            	   809:   LDX GI
+01:1476 BD0030          	   810:   LDA ORDER,X
+01:1479 20ED10          	   811:   JSR SLOTPTR
+01:147C 209814          	   812:   JSR MATCH
+01:147F 9010            	   813:   BCC .fa_f
+01:1481 206E1F          	   814:   JSR KB_POLL
+01:1484 A56E            	   815:   LDA GI
+01:1486 C553            	   816:   CMP CUR
+01:1488 D0E0            	   817:   BNE .fa_l
+01:148A A931            	   818:   LDA #<M_NF             ; back to the card shown: not elsewhere
+01:148C A21C            	   819:   LDX #>M_NF
+01:148E 4C5C13          	   820:   JMP SETMSG
+                        	   821: .fa_f:
+01:1491 A56E            	   822:   LDA GI
+01:1493 8553            	   823:   STA CUR
+01:1495 6455            	   824:   STZ FPOS
+                        	   825: .fa_x:
+01:1497 60              	   826:   RTS
+                        	   827: 
+                        	   828: ; MATCH: C=0 if the card at RP holds FINDBUF (any case)
+                        	   829: MATCH:
+01:1498 A551            	   830:   LDA RS
+01:149A 38              	   831:   SEC
+01:149B E565            	   832:   SBC FLEN
+01:149D 9022            	   833:   BCC .mt_n
+01:149F 855F            	   834:   STA T2                 ; last start position
+01:14A1 6460            	   835:   STZ T3
+                        	   836: .mt_s:
+01:14A3 A460            	   837:   LDY T3
+01:14A5 A200            	   838:   LDX #0
+                        	   839: .mt_c:
+01:14A7 B15B            	   840:   LDA (RP),Y
+01:14A9 205223          	   841:   JSR UI_UPC
+01:14AC DD8002          	   842:   CMP FINDBUF,X
+01:14AF D008            	   843:   BNE .mt_nx
+01:14B1 C8              	   844:   INY
+01:14B2 E8              	   845:   INX
+01:14B3 E465            	   846:   CPX FLEN
+01:14B5 D0F0            	   847:   BNE .mt_c
+01:14B7 18              	   848:   CLC
+01:14B8 60              	   849:   RTS
+                        	   850: .mt_nx:
+01:14B9 A560            	   851:   LDA T3
+01:14BB C55F            	   852:   CMP T2
+01:14BD E660            	   853:   INC T3
+01:14BF 90E2            	   854:   BCC .mt_s
+                        	   855: .mt_n:
+01:14C1 38              	   856:   SEC
+01:14C2 60              	   857:   RTS
+                        	   858: 
+                        	   859: ; CMD_SORT: cards in the order of the field under the cursor (Shell sort of ORDER)
+                        	   860: CMD_SORT:
+01:14C3 A554            	   861:   LDA FLD
+01:14C5 856F            	   862:   STA SFLD
+01:14C7 A200            	   863:   LDX #0
+                        	   864: .so_g:
+01:14C9 BD7215          	   865:   LDA GAPS,X
+01:14CC F04C            	   866:   BEQ .so_x
+01:14CE 856A            	   867:   STA GAP
+01:14D0 DA              	   868:   PHX
+01:14D1 C552            	   869:   CMP NREC
+01:14D3 B041            	   870:   BCS .so_ng             ; gap too large for this file
+01:14D5 856B            	   871:   STA SI                 ; i = gap .. NREC-1
+                        	   872: .so_i:
+01:14D7 A66B            	   873:   LDX SI
+01:14D9 BD0030          	   874:   LDA ORDER,X
+01:14DC 856D            	   875:   STA STMP
+01:14DE 866C            	   876:   STX SJ
+                        	   877: .so_j:
+01:14E0 A56C            	   878:   LDA SJ                 ; j >= gap and ORDER[j-gap] > tmp ?
+01:14E2 38              	   879:   SEC
+01:14E3 E56A            	   880:   SBC GAP
+01:14E5 901D            	   881:   BCC .so_put
+01:14E7 AA              	   882:   TAX
+01:14E8 BD0030          	   883:   LDA ORDER,X
+01:14EB 855D            	   884:   STA T0
+01:14ED A56D            	   885:   LDA STMP
+01:14EF 855E            	   886:   STA T1
+01:14F1 DA              	   887:   PHX
+01:14F2 202915          	   888:   JSR CMPREC
+01:14F5 FA              	   889:   PLX
+01:14F6 900C            	   890:   BCC .so_put
+01:14F8 BD0030          	   891:   LDA ORDER,X            ; ORDER[j] = ORDER[j-gap], j -= gap
+01:14FB A46C            	   892:   LDY SJ
+01:14FD 990030          	   893:   STA ORDER,Y
+01:1500 866C            	   894:   STX SJ
+01:1502 80DC            	   895:   BRA .so_j
+                        	   896: .so_put:
+01:1504 A66C            	   897:   LDX SJ
+01:1506 A56D            	   898:   LDA STMP
+01:1508 9D0030          	   899:   STA ORDER,X
+01:150B 206E1F          	   900:   JSR KB_POLL
+01:150E E66B            	   901:   INC SI
+01:1510 A56B            	   902:   LDA SI
+01:1512 C552            	   903:   CMP NREC
+01:1514 90C1            	   904:   BCC .so_i
+                        	   905: .so_ng:
+01:1516 FA              	   906:   PLX
+01:1517 E8              	   907:   INX
+01:1518 80AF            	   908:   BRA .so_g
+                        	   909: .so_x:
+01:151A 6453            	   910:   STZ CUR
+01:151C 6455            	   911:   STZ FPOS
+01:151E A901            	   912:   LDA #1
+01:1520 8556            	   913:   STA MODF
+01:1522 A93B            	   914:   LDA #<M_SORTED
+01:1524 A21C            	   915:   LDX #>M_SORTED
+01:1526 4C5C13          	   916:   JMP SETMSG
+                        	   917: 
+                        	   918: ; CMPREC: field SFLD of slot T0 against slot T1: C=1 if T0 comes after T1 (any case)
+                        	   919: CMPREC:
+01:1529 A55E            	   920:   LDA T1
+01:152B 20ED10          	   921:   JSR SLOTPTR
+01:152E A66F            	   922:   LDX SFLD
+01:1530 18              	   923:   CLC
+01:1531 A55B            	   924:   LDA RP
+01:1533 7D6802          	   925:   ADC FOFF,X
+01:1536 8563            	   926:   STA P1
+01:1538 A55C            	   927:   LDA RP+1
+01:153A 6900            	   928:   ADC #0
+01:153C 8564            	   929:   STA P1+1
+01:153E A55D            	   930:   LDA T0
+01:1540 20ED10          	   931:   JSR SLOTPTR
+01:1543 A66F            	   932:   LDX SFLD
+01:1545 18              	   933:   CLC
+01:1546 A55B            	   934:   LDA RP
+01:1548 7D6802          	   935:   ADC FOFF,X
+01:154B 8561            	   936:   STA P0
+01:154D A55C            	   937:   LDA RP+1
+01:154F 6900            	   938:   ADC #0
+01:1551 8562            	   939:   STA P0+1
+01:1553 BD6002          	   940:   LDA FWID,X
+01:1556 855F            	   941:   STA T2
+01:1558 A000            	   942:   LDY #0
+                        	   943: .cr_l:
+01:155A B163            	   944:   LDA (P1),Y
+01:155C 205223          	   945:   JSR UI_UPC
+01:155F 8560            	   946:   STA T3
+01:1561 B161            	   947:   LDA (P0),Y
+01:1563 205223          	   948:   JSR UI_UPC
+01:1566 C560            	   949:   CMP T3
+01:1568 D007            	   950:   BNE .cr_d
+01:156A C8              	   951:   INY
+01:156B C45F            	   952:   CPY T2
+01:156D D0EB            	   953:   BNE .cr_l
+01:156F 18              	   954:   CLC                    ; equal: not after
+01:1570 60              	   955:   RTS
+                        	   956: .cr_d:
+01:1571 60              	   957:   RTS                    ; (C from the CMP: 1 = after)
+                        	   958: 
+01:1572 79              	   959: GAPS:       .byte 121, 40, 13, 4, 1, 0
+01:1573 28
+01:1574 0D
+01:1575 04
+01:1576 01
+01:1577 00
+                        	   960: 
+                        	   961: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; list
+                        	   962: 
+                        	   963: ; CMD_LIST: one card per row; arrows / PgUp PgDn choose, Enter or Esc back to that card
+                        	   964: CMD_LIST:
+01:1578 A553            	   965:   LDA CUR
+01:157A 8569            	   966:   STA LSEL
+01:157C 6468            	   967:   STZ LTOP
+                        	   968: .li_d:
+01:157E A569            	   969:   LDA LSEL               ; the selected row on the screen
+01:1580 C568            	   970:   CMP LTOP
+01:1582 B002            	   971:   BCS .li_b
+01:1584 8568            	   972:   STA LTOP
+                        	   973: .li_b:
+01:1586 38              	   974:   SEC
+01:1587 E568            	   975:   SBC LTOP
+01:1589 C914            	   976:   CMP #LROWS
+01:158B 9007            	   977:   BCC .li_draw
+01:158D A569            	   978:   LDA LSEL
+01:158F 38              	   979:   SEC
+01:1590 E913            	   980:   SBC #LROWS-1
+01:1592 8568            	   981:   STA LTOP
+                        	   982: .li_draw:
+01:1594 209112          	   983:   JSR STATUS
+01:1597 201E16          	   984:   JSR LISTHEAD
+01:159A 6467            	   985:   STZ ROWI
+                        	   986: .li_r:
+01:159C 208016          	   987:   JSR LISTROW
+01:159F E667            	   988:   INC ROWI
+01:15A1 A567            	   989:   LDA ROWI
+01:15A3 C914            	   990:   CMP #LROWS
+01:15A5 D0F5            	   991:   BNE .li_r
+01:15A7 A916            	   992:   LDA #22
+01:15A9 203820          	   993:   JSR VT_ROW
+01:15AC 64A4            	   994:   STZ VT_INV
+01:15AE A9F6            	   995:   LDA #<M_LISTK
+01:15B0 A21B            	   996:   LDX #>M_LISTK
+01:15B2 A000            	   997:   LDY #0
+01:15B4 208320          	   998:   JSR VT_LINE
+01:15B7 A917            	   999:   LDA #23
+01:15B9 203820          	  1000:   JSR VT_ROW
+01:15BC A920            	  1001:   LDA #' '
+01:15BE A228            	  1002:   LDX #40
+01:15C0 205720          	  1003:   JSR VT_REP
+                        	  1004: .li_k:
+01:15C3 20AB1F          	  1005:   JSR WAITKEY
+01:15C6 C980            	  1006:   CMP #K_UP
+01:15C8 F01E            	  1007:   BEQ .li_u
+01:15CA C905            	  1008:   CMP #'E'-$40
+01:15CC F01A            	  1009:   BEQ .li_u
+01:15CE C981            	  1010:   CMP #K_DOWN
+01:15D0 F01E            	  1011:   BEQ .li_dn
+01:15D2 C918            	  1012:   CMP #'X'-$40
+01:15D4 F01A            	  1013:   BEQ .li_dn
+01:15D6 C986            	  1014:   CMP #K_PGUP
+01:15D8 F021            	  1015:   BEQ .li_pu
+01:15DA C987            	  1016:   CMP #K_PGDN
+01:15DC F02B            	  1017:   BEQ .li_pd
+01:15DE C90D            	  1018:   CMP #K_CR
+01:15E0 F035            	  1019:   BEQ .li_x
+01:15E2 C91B            	  1020:   CMP #K_ESC
+01:15E4 F031            	  1021:   BEQ .li_x
+01:15E6 80DB            	  1022:   BRA .li_k
+                        	  1023: .li_u:
+01:15E8 A569            	  1024:   LDA LSEL
+01:15EA F0D7            	  1025:   BEQ .li_k
+01:15EC C669            	  1026:   DEC LSEL
+01:15EE 808E            	  1027:   BRA .li_d
+                        	  1028: .li_dn:
+01:15F0 A569            	  1029:   LDA LSEL
+01:15F2 1A              	  1030:   INC A
+01:15F3 C552            	  1031:   CMP NREC
+01:15F5 B0CC            	  1032:   BCS .li_k
+01:15F7 8569            	  1033:   STA LSEL
+01:15F9 8083            	  1034:   BRA .li_d
+                        	  1035: .li_pu:
+01:15FB A569            	  1036:   LDA LSEL
+01:15FD 38              	  1037:   SEC
+01:15FE E914            	  1038:   SBC #LROWS
+01:1600 B002            	  1039:   BCS .li_ps
+01:1602 A900            	  1040:   LDA #0
+                        	  1041: .li_ps:
+01:1604 8569            	  1042:   STA LSEL
+01:1606 4C7E15          	  1043:   JMP .li_d
+                        	  1044: .li_pd:
+01:1609 A569            	  1045:   LDA LSEL
+01:160B 18              	  1046:   CLC
+01:160C 6914            	  1047:   ADC #LROWS
+01:160E C552            	  1048:   CMP NREC
+01:1610 90F2            	  1049:   BCC .li_ps
+01:1612 A552            	  1050:   LDA NREC
+01:1614 3A              	  1051:   DEC A
+01:1615 80ED            	  1052:   BRA .li_ps
+                        	  1053: .li_x:
+01:1617 A569            	  1054:   LDA LSEL
+01:1619 8553            	  1055:   STA CUR
+01:161B 6455            	  1056:   STZ FPOS
+01:161D 60              	  1057:   RTS
+                        	  1058: 
+                        	  1059: ; LISTHEAD: row 1: field names in their columns (inverse)
+                        	  1060: LISTHEAD:
+01:161E A901            	  1061:   LDA #1
+01:1620 203820          	  1062:   JSR VT_ROW
+01:1623 A9A0            	  1063:   LDA #' '+$80
+01:1625 8D00B0          	  1064:   STA VDP_DATA
+01:1628 8D00B0          	  1065:   STA VDP_DATA
+01:162B 8D00B0          	  1066:   STA VDP_DATA
+01:162E 8D00B0          	  1067:   STA VDP_DATA
+01:1631 A924            	  1068:   LDA #36
+01:1633 8570            	  1069:   STA COLS
+01:1635 6467            	  1070:   STZ ROWI
+                        	  1071: .lh_f:
+01:1637 A567            	  1072:   LDA ROWI
+01:1639 C550            	  1073:   CMP NF
+01:163B B03C            	  1074:   BCS .lh_e
+01:163D A667            	  1075:   LDX ROWI
+01:163F BD6002          	  1076:   LDA FWID,X
+01:1642 C570            	  1077:   CMP COLS
+01:1644 9002            	  1078:   BCC .lh_w
+01:1646 A570            	  1079:   LDA COLS
+                        	  1080: .lh_w:
+01:1648 855E            	  1081:   STA T1                 ; characters of this column
+01:164A 207B12          	  1082:   JSR FNAMEP
+01:164D A000            	  1083:   LDY #0
+                        	  1084: .lh_c:
+01:164F C45E            	  1085:   CPY T1
+01:1651 B010            	  1086:   BCS .lh_n
+01:1653 A920            	  1087:   LDA #' '
+01:1655 C00A            	  1088:   CPY #NAMEW
+01:1657 B002            	  1089:   BCS .lh_s
+01:1659 B161            	  1090:   LDA (P0),Y
+                        	  1091: .lh_s:
+01:165B 0980            	  1092:   ORA #$80
+01:165D 8D00B0          	  1093:   STA VDP_DATA
+01:1660 C8              	  1094:   INY
+01:1661 80EC            	  1095:   BRA .lh_c
+                        	  1096: .lh_n:
+01:1663 38              	  1097:   SEC
+01:1664 A570            	  1098:   LDA COLS
+01:1666 E55E            	  1099:   SBC T1
+01:1668 8570            	  1100:   STA COLS
+01:166A F00D            	  1101:   BEQ .lh_e
+01:166C A9A0            	  1102:   LDA #' '+$80
+01:166E 8D00B0          	  1103:   STA VDP_DATA
+01:1671 C670            	  1104:   DEC COLS
+01:1673 F004            	  1105:   BEQ .lh_e
+01:1675 E667            	  1106:   INC ROWI
+01:1677 80BE            	  1107:   BRA .lh_f
+                        	  1108: .lh_e:
+01:1679 A670            	  1109:   LDX COLS
+01:167B A9A0            	  1110:   LDA #' '+$80
+01:167D 4C5720          	  1111:   JMP VT_REP
+                        	  1112: 
+                        	  1113: ; LISTROW: screen row ROWI+2 = card LTOP+ROWI
+                        	  1114: LISTROW:
+01:1680 A567            	  1115:   LDA ROWI
+01:1682 18              	  1116:   CLC
+01:1683 6902            	  1117:   ADC #2
+01:1685 203820          	  1118:   JSR VT_ROW
+01:1688 A567            	  1119:   LDA ROWI
+01:168A 18              	  1120:   CLC
+01:168B 6568            	  1121:   ADC LTOP
+01:168D 856E            	  1122:   STA GI
+01:168F C552            	  1123:   CMP NREC
+01:1691 9007            	  1124:   BCC .lr_c
+01:1693 A920            	  1125:   LDA #' '
+01:1695 A228            	  1126:   LDX #40
+01:1697 4C5720          	  1127:   JMP VT_REP
+                        	  1128: .lr_c:
+01:169A 6460            	  1129:   STZ T3                 ; inverse for the selected card
+01:169C C569            	  1130:   CMP LSEL
+01:169E D004            	  1131:   BNE .lr_n
+01:16A0 A980            	  1132:   LDA #$80
+01:16A2 8560            	  1133:   STA T3
+                        	  1134: .lr_n:
+01:16A4 A56E            	  1135:   LDA GI                 ; number: 3 digits and a space
+01:16A6 1A              	  1136:   INC A
+01:16A7 85A5            	  1137:   STA NUM
+01:16A9 64A6            	  1138:   STZ NUM+1
+01:16AB A9A0            	  1139:   LDA #<UI_LINE
+01:16AD 85A2            	  1140:   STA VT_P
+01:16AF A902            	  1141:   LDA #>UI_LINE
+01:16B1 85A3            	  1142:   STA VT_P+1
+01:16B3 A000            	  1143:   LDY #0
+01:16B5 201221          	  1144:   JSR NUMSTR             ; (5 characters, the last 3 are used)
+01:16B8 A202            	  1145:   LDX #2
+                        	  1146: .lr_nm:
+01:16BA BDA002          	  1147:   LDA UI_LINE,X
+01:16BD 0560            	  1148:   ORA T3
+01:16BF 8D00B0          	  1149:   STA VDP_DATA
+01:16C2 E8              	  1150:   INX
+01:16C3 E005            	  1151:   CPX #5
+01:16C5 D0F3            	  1152:   BNE .lr_nm
+01:16C7 A920            	  1153:   LDA #' '
+01:16C9 0560            	  1154:   ORA T3
+01:16CB 8D00B0          	  1155:   STA VDP_DATA
+01:16CE A66E            	  1156:   LDX GI
+01:16D0 BD0030          	  1157:   LDA ORDER,X
+01:16D3 20ED10          	  1158:   JSR SLOTPTR
+01:16D6 A924            	  1159:   LDA #36
+01:16D8 8570            	  1160:   STA COLS
+01:16DA 646A            	  1161:   STZ GAP                ; (field counter)
+                        	  1162: .lr_f:
+01:16DC A56A            	  1163:   LDA GAP
+01:16DE C550            	  1164:   CMP NF
+01:16E0 B039            	  1165:   BCS .lr_e
+01:16E2 AA              	  1166:   TAX
+01:16E3 BD6002          	  1167:   LDA FWID,X
+01:16E6 C570            	  1168:   CMP COLS
+01:16E8 9002            	  1169:   BCC .lr_w
+01:16EA A570            	  1170:   LDA COLS
+                        	  1171: .lr_w:
+01:16EC 855E            	  1172:   STA T1
+01:16EE BD6802          	  1173:   LDA FOFF,X
+01:16F1 A8              	  1174:   TAY
+01:16F2 A200            	  1175:   LDX #0
+                        	  1176: .lr_v:
+01:16F4 E45E            	  1177:   CPX T1
+01:16F6 B00B            	  1178:   BCS .lr_vn
+01:16F8 B15B            	  1179:   LDA (RP),Y
+01:16FA 0560            	  1180:   ORA T3
+01:16FC 8D00B0          	  1181:   STA VDP_DATA
+01:16FF C8              	  1182:   INY
+01:1700 E8              	  1183:   INX
+01:1701 80F1            	  1184:   BRA .lr_v
+                        	  1185: .lr_vn:
+01:1703 38              	  1186:   SEC
+01:1704 A570            	  1187:   LDA COLS
+01:1706 E55E            	  1188:   SBC T1
+01:1708 8570            	  1189:   STA COLS
+01:170A F00F            	  1190:   BEQ .lr_e
+01:170C A920            	  1191:   LDA #' '
+01:170E 0560            	  1192:   ORA T3
+01:1710 8D00B0          	  1193:   STA VDP_DATA
+01:1713 C670            	  1194:   DEC COLS
+01:1715 F004            	  1195:   BEQ .lr_e
+01:1717 E66A            	  1196:   INC GAP
+01:1719 80C1            	  1197:   BRA .lr_f
+                        	  1198: .lr_e:
+01:171B A670            	  1199:   LDX COLS
+01:171D A920            	  1200:   LDA #' '
+01:171F 0560            	  1201:   ORA T3
+01:1721 205720          	  1202:   JSR VT_REP
+01:1724 4C6E1F          	  1203:   JMP KB_POLL
+                        	  1204: 
+                        	  1205: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; files
+                        	  1206: 
+                        	  1207: CMD_SAVE:
+01:1727 AD7002          	  1208:   LDA DOCNAME
+01:172A D03D            	  1209:   BNE DOSAVE
+                        	  1210: CMD_SAVEAS:
+01:172C A20C            	  1211:   LDX #NAMELEN
+                        	  1212: .sa_c:
+01:172E BD7002          	  1213:   LDA DOCNAME,X
+01:1731 9DD802          	  1214:   STA UI_BUF,X
+01:1734 CA              	  1215:   DEX
+01:1735 10F7            	  1216:   BPL .sa_c
+01:1737 A90C            	  1217:   LDA #NAMELEN
+01:1739 85B2            	  1218:   STA UI_PMAX
+01:173B A901            	  1219:   LDA #1
+01:173D 85B3            	  1220:   STA UI_PUPC
+01:173F A9BC            	  1221:   LDA #<P_SAVE
+01:1741 A21C            	  1222:   LDX #>P_SAVE
+01:1743 20C622          	  1223:   JSR PROMPT
+01:1746 B020            	  1224:   BCS .sa_x
+01:1748 C900            	  1225:   CMP #0
+01:174A F01B            	  1226:   BEQ .sa_no
+01:174C A200            	  1227:   LDX #0
+                        	  1228: .sa_n:
+01:174E BDD802          	  1229:   LDA UI_BUF,X
+01:1751 9D7002          	  1230:   STA DOCNAME,X
+01:1754 F007            	  1231:   BEQ .sa_z
+01:1756 E8              	  1232:   INX
+01:1757 E00C            	  1233:   CPX #NAMELEN
+01:1759 D0F3            	  1234:   BNE .sa_n
+01:175B 800C            	  1235:   BRA DOSAVE
+                        	  1236: .sa_z:
+01:175D 9E7002          	  1237:   STZ DOCNAME,X
+01:1760 E8              	  1238:   INX
+01:1761 E00D            	  1239:   CPX #NAMELEN+1
+01:1763 D0F8            	  1240:   BNE .sa_z
+01:1765 8002            	  1241:   BRA DOSAVE
+                        	  1242: .sa_no:
+01:1767 38              	  1243:   SEC
+                        	  1244: .sa_x:
+01:1768 60              	  1245:   RTS
+                        	  1246: 
+                        	  1247: ; DOSAVE: "BOFL", 1, NF, NF x (name, width), NREC, the cards in their order. C=1 error
+                        	  1248: DOSAVE:
+01:1769 204E21          	  1249:   JSR DOC_RDIDX
+01:176C 9003            	  1250:   BCC .fb4
+01:176E 4C0318          	  1251:   JMP .ds_err
+                        	  1252: .fb4:
+01:1771 A970            	  1253:   LDA #<DOCNAME
+01:1773 85A2            	  1254:   STA DOC_P
+01:1775 A902            	  1255:   LDA #>DOCNAME
+01:1777 85A3            	  1256:   STA DOC_P+1
+01:1779 209F21          	  1257:   JSR DOC_FIND
+01:177C 900E            	  1258:   BCC .ds_k
+01:177E 20CF21          	  1259:   JSR DOC_FREE
+01:1781 9009            	  1260:   BCC .ds_k
+01:1783 A970            	  1261:   LDA #<M_NOSLOT
+01:1785 A21C            	  1262:   LDX #>M_NOSLOT
+01:1787 205C13          	  1263:   JSR SETMSG
+01:178A 38              	  1264:   SEC
+01:178B 60              	  1265:   RTS
+                        	  1266: .ds_k:
+01:178C 8566            	  1267:   STA DOCSLOT
+01:178E 85AC            	  1268:   STA DOC_K
+01:1790 205D25          	  1269:   JSR ST_WOPEN
+01:1793 A200            	  1270:   LDX #0
+                        	  1271: .ds_h:
+01:1795 BD2A1B          	  1272:   LDA F_MAGIC,X
+01:1798 206625          	  1273:   JSR ST_PUT
+01:179B E8              	  1274:   INX
+01:179C E005            	  1275:   CPX #5
+01:179E D0F5            	  1276:   BNE .ds_h
+01:17A0 A550            	  1277:   LDA NF
+01:17A2 206625          	  1278:   JSR ST_PUT
+01:17A5 6467            	  1279:   STZ ROWI
+                        	  1280: .ds_f:
+01:17A7 207B12          	  1281:   JSR FNAMEP
+01:17AA A000            	  1282:   LDY #0
+                        	  1283: .ds_fn:
+01:17AC B161            	  1284:   LDA (P0),Y
+01:17AE 206625          	  1285:   JSR ST_PUT
+01:17B1 C8              	  1286:   INY
+01:17B2 C00A            	  1287:   CPY #NAMEW
+01:17B4 D0F6            	  1288:   BNE .ds_fn
+01:17B6 A667            	  1289:   LDX ROWI
+01:17B8 BD6002          	  1290:   LDA FWID,X
+01:17BB 206625          	  1291:   JSR ST_PUT
+01:17BE E667            	  1292:   INC ROWI
+01:17C0 A567            	  1293:   LDA ROWI
+01:17C2 C550            	  1294:   CMP NF
+01:17C4 D0E1            	  1295:   BNE .ds_f
+01:17C6 A552            	  1296:   LDA NREC
+01:17C8 206625          	  1297:   JSR ST_PUT
+01:17CB 646E            	  1298:   STZ GI
+                        	  1299: .ds_r:
+01:17CD A66E            	  1300:   LDX GI
+01:17CF BD0030          	  1301:   LDA ORDER,X
+01:17D2 20ED10          	  1302:   JSR SLOTPTR
+01:17D5 A000            	  1303:   LDY #0
+                        	  1304: .ds_rb:
+01:17D7 B15B            	  1305:   LDA (RP),Y
+01:17D9 206625          	  1306:   JSR ST_PUT
+01:17DC C8              	  1307:   INY
+01:17DD C451            	  1308:   CPY RS
+01:17DF D0F6            	  1309:   BNE .ds_rb
+01:17E1 E66E            	  1310:   INC GI
+01:17E3 A56E            	  1311:   LDA GI
+01:17E5 C552            	  1312:   CMP NREC
+01:17E7 D0E4            	  1313:   BNE .ds_r
+01:17E9 20B025          	  1314:   JSR ST_WCLOSE
+01:17EC B015            	  1315:   BCS .ds_err
+01:17EE A566            	  1316:   LDA DOCSLOT
+01:17F0 20E721          	  1317:   JSR DOC_SETENT
+01:17F3 208121          	  1318:   JSR DOC_WRIDX
+01:17F6 B00B            	  1319:   BCS .ds_err
+01:17F8 6456            	  1320:   STZ MODF
+01:17FA A963            	  1321:   LDA #<M_SAVED
+01:17FC A21C            	  1322:   LDX #>M_SAVED
+01:17FE 205C13          	  1323:   JSR SETMSG
+01:1801 18              	  1324:   CLC
+01:1802 60              	  1325:   RTS
+                        	  1326: .ds_err:
+01:1803 A942            	  1327:   LDA #<M_SDERR
+01:1805 A21C            	  1328:   LDX #>M_SDERR
+01:1807 205C13          	  1329:   JSR SETMSG
+01:180A 38              	  1330:   SEC
+01:180B 60              	  1331:   RTS
+                        	  1332: 
+                        	  1333: CMD_SAVEX:
+01:180C A556            	  1334:   LDA MODF
+01:180E F00C            	  1335:   BEQ EXIT
+01:1810 202717          	  1336:   JSR CMD_SAVE
+01:1813 9007            	  1337:   BCC EXIT
+01:1815 60              	  1338:   RTS
+                        	  1339: 
+                        	  1340: CMD_QUIT:
+01:1816 202218          	  1341:   JSR CHKMOD
+01:1819 9001            	  1342:   BCC EXIT
+01:181B 60              	  1343:   RTS
+                        	  1344: 
+                        	  1345: EXIT:
+01:181C 20571F          	  1346:   JSR KB_EXIT
+01:181F 4C0FFD          	  1347:   JMP JT_SHOW_MENU
+                        	  1348: 
+                        	  1349: ; CHKMOD: C=1 keep the file (changed and the answer was not Y)
+                        	  1350: CHKMOD:
+01:1822 A556            	  1351:   LDA MODF
+01:1824 F007            	  1352:   BEQ .ck_x
+01:1826 A9F0            	  1353:   LDA #<Q_ABANDON
+01:1828 A21C            	  1354:   LDX #>Q_ABANDON
+01:182A 4C5D23          	  1355:   JMP YESNO
+                        	  1356: .ck_x:
+01:182D 18              	  1357:   CLC
+01:182E 60              	  1358:   RTS
+                        	  1359: 
+                        	  1360: CMD_OPEN:
+01:182F 64B7            	  1361:   STZ UI_ANY
+01:1831 A997            	  1362:   LDA #<M_OPEN
+01:1833 A21C            	  1363:   LDX #>M_OPEN
+01:1835 207A23          	  1364:   JSR DOC_PICK
+01:1838 900C            	  1365:   BCC .op_go
+01:183A C900            	  1366:   CMP #0
+01:183C F007            	  1367:   BEQ .op_x
+                        	  1368: .op_err:
+01:183E A942            	  1369:   LDA #<M_SDERR
+01:1840 A21C            	  1370:   LDX #>M_SDERR
+01:1842 4C5C13          	  1371:   JMP SETMSG
+                        	  1372: .op_x:
+01:1845 60              	  1373:   RTS
+                        	  1374: .op_go:
+01:1846 8566            	  1375:   STA DOCSLOT
+01:1848 202218          	  1376:   JSR CHKMOD
+01:184B B0F8            	  1377:   BCS .op_x
+01:184D A566            	  1378:   LDA DOCSLOT
+01:184F 85AC            	  1379:   STA DOC_K
+01:1851 208B21          	  1380:   JSR DOC_ENTRY
+01:1854 A001            	  1381:   LDY #1
+01:1856 B1AA            	  1382:   LDA (DOC_E),Y
+01:1858 85B9            	  1383:   STA DOC_LEN
+01:185A C8              	  1384:   INY
+01:185B B1AA            	  1385:   LDA (DOC_E),Y
+01:185D 85BA            	  1386:   STA DOC_LEN+1
+01:185F 20C425          	  1387:   JSR ST_ROPEN
+01:1862 A200            	  1388:   LDX #0                 ; magic and version
+                        	  1389: .op_h:
+01:1864 20D725          	  1390:   JSR ST_GET
+01:1867 9003            	  1391:   BCC .fb3
+01:1869 4C1A19          	  1392:   JMP .op_bad
+                        	  1393: .fb3:
+01:186C DD2A1B          	  1394:   CMP F_MAGIC,X
+01:186F F003            	  1395:   BEQ .fb2
+01:1871 4C1A19          	  1396:   JMP .op_bad
+                        	  1397: .fb2:
+01:1874 E8              	  1398:   INX
+01:1875 E005            	  1399:   CPX #5
+01:1877 D0EB            	  1400:   BNE .op_h
+01:1879 20D725          	  1401:   JSR ST_GET
+01:187C 9003            	  1402:   BCC .fb1
+01:187E 4C1A19          	  1403:   JMP .op_bad
+                        	  1404: .fb1:
+01:1881 C901            	  1405:   CMP #1
+01:1883 B003            	  1406:   BCS .fb8
+01:1885 4C1A19          	  1407:   JMP .op_bad
+                        	  1408: .fb8:
+01:1888 C909            	  1409:   CMP #MAXF+1
+01:188A 9003            	  1410:   BCC .fb7
+01:188C 4C1A19          	  1411:   JMP .op_bad
+                        	  1412: .fb7:
+01:188F 8550            	  1413:   STA NF
+01:1891 A200            	  1414:   LDX #0                 ; names and widths
+                        	  1415: .op_f:
+01:1893 8667            	  1416:   STX ROWI
+01:1895 207B12          	  1417:   JSR FNAMEP
+01:1898 A000            	  1418:   LDY #0
+                        	  1419: .op_fn:
+01:189A 20D725          	  1420:   JSR ST_GET
+01:189D B07B            	  1421:   BCS .op_bad
+01:189F 9161            	  1422:   STA (P0),Y
+01:18A1 C8              	  1423:   INY
+01:18A2 C00A            	  1424:   CPY #NAMEW
+01:18A4 D0F4            	  1425:   BNE .op_fn
+01:18A6 20D725          	  1426:   JSR ST_GET
+01:18A9 B06F            	  1427:   BCS .op_bad
+01:18AB A667            	  1428:   LDX ROWI
+01:18AD 9D6002          	  1429:   STA FWID,X
+01:18B0 E8              	  1430:   INX
+01:18B1 E450            	  1431:   CPX NF
+01:18B3 D0DE            	  1432:   BNE .op_f
+01:18B5 20A210          	  1433:   JSR FORMSET
+01:18B8 20D725          	  1434:   JSR ST_GET
+01:18BB B05D            	  1435:   BCS .op_bad
+01:18BD C557            	  1436:   CMP MAXREC
+01:18BF 9002            	  1437:   BCC .op_n
+01:18C1 A557            	  1438:   LDA MAXREC
+                        	  1439: .op_n:
+01:18C3 8552            	  1440:   STA NREC
+01:18C5 646E            	  1441:   STZ GI
+                        	  1442: .op_r:
+01:18C7 A56E            	  1443:   LDA GI
+01:18C9 C552            	  1444:   CMP NREC
+01:18CB F01E            	  1445:   BEQ .op_ok
+01:18CD A66E            	  1446:   LDX GI
+01:18CF 8A              	  1447:   TXA
+01:18D0 9D0030          	  1448:   STA ORDER,X
+01:18D3 20ED10          	  1449:   JSR SLOTPTR
+01:18D6 A000            	  1450:   LDY #0
+                        	  1451: .op_rb:
+01:18D8 20D725          	  1452:   JSR ST_GET
+01:18DB B03D            	  1453:   BCS .op_bad
+01:18DD 915B            	  1454:   STA (RP),Y
+01:18DF C8              	  1455:   INY
+01:18E0 C451            	  1456:   CPY RS
+01:18E2 D0F4            	  1457:   BNE .op_rb
+01:18E4 206E1F          	  1458:   JSR KB_POLL
+01:18E7 E66E            	  1459:   INC GI
+01:18E9 80DC            	  1460:   BRA .op_r
+                        	  1461: .op_ok:
+01:18EB A200            	  1462:   LDX #0                 ; the name from the index
+01:18ED A566            	  1463:   LDA DOCSLOT
+01:18EF 208B21          	  1464:   JSR DOC_ENTRY
+01:18F2 A004            	  1465:   LDY #4
+                        	  1466: .op_nm:
+01:18F4 B1AA            	  1467:   LDA (DOC_E),Y
+01:18F6 9D7002          	  1468:   STA DOCNAME,X
+01:18F9 C8              	  1469:   INY
+01:18FA E8              	  1470:   INX
+01:18FB E00C            	  1471:   CPX #NAMELEN
+01:18FD D0F5            	  1472:   BNE .op_nm
+01:18FF 9E7002          	  1473:   STZ DOCNAME,X
+01:1902 6453            	  1474:   STZ CUR
+01:1904 6454            	  1475:   STZ FLD
+01:1906 6455            	  1476:   STZ FPOS
+01:1908 6456            	  1477:   STZ MODF
+01:190A A552            	  1478:   LDA NREC
+01:190C D005            	  1479:   BNE .op_l
+01:190E 202111          	  1480:   JSR ADDREC
+01:1911 6456            	  1481:   STZ MODF
+                        	  1482: .op_l:
+01:1913 A969            	  1483:   LDA #<M_LOADED
+01:1915 A21C            	  1484:   LDX #>M_LOADED
+01:1917 4C5C13          	  1485:   JMP SETMSG
+                        	  1486: .op_bad:
+01:191A 202319          	  1487:   JSR FORMDEF
+01:191D 20D510          	  1488:   JSR FILENEW
+01:1920 4C3E18          	  1489:   JMP .op_err
+                        	  1490: 
+                        	  1491: ; FORMDEF: the address book form again
+                        	  1492: FORMDEF:
+01:1923 A257            	  1493:   LDX #DEFFORM_L-1
+                        	  1494: .fd_f:
+01:1925 BDD21A          	  1495:   LDA DEFFORM,X
+01:1928 9D1002          	  1496:   STA FNAME,X
+01:192B CA              	  1497:   DEX
+01:192C 10F7            	  1498:   BPL .fd_f
+01:192E A907            	  1499:   LDA #DEFNF
+01:1930 8550            	  1500:   STA NF
+01:1932 4CA210          	  1501:   JMP FORMSET
+                        	  1502: 
+                        	  1503: ; CMD_NEWFILE: ^KN a new form: up to 8 fields, name and width each
+                        	  1504: CMD_NEWFILE:
+01:1935 202218          	  1505:   JSR CHKMOD
+01:1938 9003            	  1506:   BCC .fb6
+01:193A 4CC719          	  1507:   JMP .nf_x
+                        	  1508: .fb6:
+01:193D A257            	  1509:   LDX #DEFFORM_L-1       ; a copy of the form, back if Esc
+                        	  1510: .nf_b:
+01:193F BD1002          	  1511:   LDA FNAME,X
+01:1942 9D0009          	  1512:   STA FORMBAK,X
+01:1945 CA              	  1513:   DEX
+01:1946 10F7            	  1514:   BPL .nf_b
+01:1948 6467            	  1515:   STZ ROWI
+                        	  1516: .nf_f:
+01:194A 207B12          	  1517:   JSR FNAMEP             ; field name
+01:194D 9CD802          	  1518:   STZ UI_BUF
+01:1950 A90A            	  1519:   LDA #NAMEW
+01:1952 85B2            	  1520:   STA UI_PMAX
+01:1954 A901            	  1521:   LDA #1
+01:1956 85B3            	  1522:   STA UI_PUPC
+01:1958 A567            	  1523:   LDA ROWI
+01:195A 18              	  1524:   CLC
+01:195B 6931            	  1525:   ADC #'1'
+01:195D 8DCC1C          	  1526:   STA P_FNAME+6
+01:1960 A9C6            	  1527:   LDA #<P_FNAME
+01:1962 A21C            	  1528:   LDX #>P_FNAME
+01:1964 20C622          	  1529:   JSR PROMPT
+01:1967 B053            	  1530:   BCS .nf_esc            ; Esc: the old form stays
+01:1969 C900            	  1531:   CMP #0
+01:196B F043            	  1532:   BEQ .nf_end
+01:196D A000            	  1533:   LDY #0                 ; name, padded with spaces
+                        	  1534: .nf_n:
+01:196F B9D802          	  1535:   LDA UI_BUF,Y
+01:1972 F009            	  1536:   BEQ .nf_pad
+01:1974 9161            	  1537:   STA (P0),Y
+01:1976 C8              	  1538:   INY
+01:1977 C00A            	  1539:   CPY #NAMEW
+01:1979 D0F4            	  1540:   BNE .nf_n
+01:197B 8009            	  1541:   BRA .nf_w
+                        	  1542: .nf_pad:
+01:197D A920            	  1543:   LDA #' '
+                        	  1544: .nf_pl:
+01:197F 9161            	  1545:   STA (P0),Y
+01:1981 C8              	  1546:   INY
+01:1982 C00A            	  1547:   CPY #NAMEW
+01:1984 D0F9            	  1548:   BNE .nf_pl
+                        	  1549: .nf_w:
+01:1986 9CD802          	  1550:   STZ UI_BUF             ; width
+01:1989 A902            	  1551:   LDA #2
+01:198B 85B2            	  1552:   STA UI_PMAX
+01:198D A9E1            	  1553:   LDA #<P_FWIDTH
+01:198F A21C            	  1554:   LDX #>P_FWIDTH
+01:1991 20C622          	  1555:   JSR PROMPT
+01:1994 B026            	  1556:   BCS .nf_esc
+01:1996 20C819          	  1557:   JSR SMALLNUM
+01:1999 B0EB            	  1558:   BCS .nf_w
+01:199B C901            	  1559:   CMP #1
+01:199D 90E7            	  1560:   BCC .nf_w
+01:199F C91D            	  1561:   CMP #MAXW+1
+01:19A1 B0E3            	  1562:   BCS .nf_w
+01:19A3 A667            	  1563:   LDX ROWI
+01:19A5 9D6002          	  1564:   STA FWID,X
+01:19A8 E667            	  1565:   INC ROWI
+01:19AA A567            	  1566:   LDA ROWI
+01:19AC C908            	  1567:   CMP #MAXF
+01:19AE D09A            	  1568:   BNE .nf_f
+                        	  1569: .nf_end:
+01:19B0 A567            	  1570:   LDA ROWI
+01:19B2 F008            	  1571:   BEQ .nf_esc            ; no field: nothing changes
+01:19B4 8550            	  1572:   STA NF
+01:19B6 20A210          	  1573:   JSR FORMSET
+01:19B9 4CD510          	  1574:   JMP FILENEW
+                        	  1575: .nf_esc:
+01:19BC A257            	  1576:   LDX #DEFFORM_L-1
+                        	  1577: .nf_r:
+01:19BE BD0009          	  1578:   LDA FORMBAK,X
+01:19C1 9D1002          	  1579:   STA FNAME,X
+01:19C4 CA              	  1580:   DEX
+01:19C5 10F7            	  1581:   BPL .nf_r
+                        	  1582: .nf_x:
+01:19C7 60              	  1583:   RTS
+                        	  1584: 
+                        	  1585: ; SMALLNUM: UI_BUF (digits) -> A (0-99). C=1 not a number
+                        	  1586: SMALLNUM:
+01:19C8 ADD802          	  1587:   LDA UI_BUF
+01:19CB F029            	  1588:   BEQ .sn_e
+01:19CD A200            	  1589:   LDX #0
+01:19CF 645D            	  1590:   STZ T0
+                        	  1591: .sn_l:
+01:19D1 BDD802          	  1592:   LDA UI_BUF,X
+01:19D4 F01C            	  1593:   BEQ .sn_x
+01:19D6 C930            	  1594:   CMP #'0'
+01:19D8 901C            	  1595:   BCC .sn_e
+01:19DA C93A            	  1596:   CMP #'9'+1
+01:19DC B018            	  1597:   BCS .sn_e
+01:19DE 290F            	  1598:   AND #$0F
+01:19E0 48              	  1599:   PHA
+01:19E1 A55D            	  1600:   LDA T0
+01:19E3 0A              	  1601:   ASL
+01:19E4 0A              	  1602:   ASL
+01:19E5 655D            	  1603:   ADC T0
+01:19E7 0A              	  1604:   ASL
+01:19E8 855D            	  1605:   STA T0
+01:19EA 68              	  1606:   PLA
+01:19EB 655D            	  1607:   ADC T0
+01:19ED 855D            	  1608:   STA T0
+01:19EF E8              	  1609:   INX
+01:19F0 80DF            	  1610:   BRA .sn_l
+                        	  1611: .sn_x:
+01:19F2 A55D            	  1612:   LDA T0
+01:19F4 18              	  1613:   CLC
+01:19F5 60              	  1614:   RTS
+                        	  1615: .sn_e:
+01:19F6 38              	  1616:   SEC
+01:19F7 60              	  1617:   RTS
+                        	  1618: 
+                        	  1619: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; help
+                        	  1620: 
+                        	  1621: CMD_HELP:
+01:19F8 20A720          	  1622:   JSR VT_CLS
+01:19FB A923            	  1623:   LDA #<HELPTXT
+01:19FD 8561            	  1624:   STA P0
+01:19FF A91D            	  1625:   LDA #>HELPTXT
+01:1A01 8562            	  1626:   STA P0+1
+01:1A03 6467            	  1627:   STZ ROWI
+                        	  1628: .hp_r:
+01:1A05 B261            	  1629:   LDA (P0)
+01:1A07 C9FF            	  1630:   CMP #$FF
+01:1A09 F031            	  1631:   BEQ .hp_k
+01:1A0B A567            	  1632:   LDA ROWI
+01:1A0D 203820          	  1633:   JSR VT_ROW
+01:1A10 A567            	  1634:   LDA ROWI
+01:1A12 D004            	  1635:   BNE .hp_n
+01:1A14 A980            	  1636:   LDA #$80
+01:1A16 8002            	  1637:   BRA .hp_i
+                        	  1638: .hp_n:
+01:1A18 A900            	  1639:   LDA #0
+                        	  1640: .hp_i:
+01:1A1A 85A4            	  1641:   STA VT_INV
+01:1A1C A561            	  1642:   LDA P0
+01:1A1E A662            	  1643:   LDX P0+1
+01:1A20 A000            	  1644:   LDY #0
+01:1A22 208320          	  1645:   JSR VT_LINE
+01:1A25 A000            	  1646:   LDY #0
+                        	  1647: .hp_s:
+01:1A27 B161            	  1648:   LDA (P0),Y
+01:1A29 C8              	  1649:   INY
+01:1A2A C900            	  1650:   CMP #0
+01:1A2C D0F9            	  1651:   BNE .hp_s
+01:1A2E 98              	  1652:   TYA
+01:1A2F 18              	  1653:   CLC
+01:1A30 6561            	  1654:   ADC P0
+01:1A32 8561            	  1655:   STA P0
+01:1A34 9002            	  1656:   BCC .hp_c
+01:1A36 E662            	  1657:   INC P0+1
+                        	  1658: .hp_c:
+01:1A38 E667            	  1659:   INC ROWI
+01:1A3A 80C9            	  1660:   BRA .hp_r
+                        	  1661: .hp_k:
+01:1A3C 64A4            	  1662:   STZ VT_INV
+01:1A3E 20AB1F          	  1663:   JSR WAITKEY
+01:1A41 4CA720          	  1664:   JMP VT_CLS
+                        	  1665: 
+                        	  1666: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; tables and texts
+                        	  1667: 
+                        	  1668: CTRLTAB:
+01:1A44 9C10            	  1669:   .word NOP_CMD, CMD_HOME, NOP_CMD, CMD_PGDN           ; ^@ ^A ^B ^C
+01:1A46 C913
+01:1A48 9C10
+01:1A4A 0814
+01:1A4C BC13            	  1670:   .word CMD_RIGHT, CMD_UP, CMD_END, CMD_DEL            ; ^D ^E ^F ^G
+01:1A4E E513
+01:1A50 CC13
+01:1A52 9913
+01:1A54 8F13            	  1671:   .word CMD_BKSP, CMD_DOWN, CMD_HELP, CMD_PFXK         ; ^H ^I ^J ^K
+01:1A56 F113
+01:1A58 F819
+01:1A5A 9D10
+01:1A5C 6214            	  1672:   .word CMD_FINDAG, CMD_DOWN, CMD_NEWREC, NOP_CMD      ; ^L ^M ^N ^O
+01:1A5E F113
+01:1A60 2114
+01:1A62 9C10
+01:1A64 9C10            	  1673:   .word NOP_CMD, NOP_CMD, CMD_PGUP, CMD_LEFT           ; ^P ^Q ^R ^S
+01:1A66 9C10
+01:1A68 FF13
+01:1A6A B513
+01:1A6C 1414            	  1674:   .word CMD_FIRST, NOP_CMD, NOP_CMD, NOP_CMD           ; ^T ^U ^V ^W
+01:1A6E 9C10
+01:1A70 9C10
+01:1A72 9C10
+01:1A74 F113            	  1675:   .word CMD_DOWN, CMD_DELREC, CMD_LAST, NOP_CMD        ; ^X ^Y ^Z Esc
+01:1A76 2414
+01:1A78 1914
+01:1A7A 9C10
+01:1A7C 9C10            	  1676:   .word NOP_CMD, NOP_CMD, NOP_CMD, NOP_CMD
+01:1A7E 9C10
+01:1A80 9C10
+01:1A82 9C10
+                        	  1677: EXTTAB:
+01:1A84 E513            	  1678:   .word CMD_UP, CMD_DOWN, CMD_LEFT, CMD_RIGHT          ; arrows
+01:1A86 F113
+01:1A88 B513
+01:1A8A BC13
+01:1A8C C913            	  1679:   .word CMD_HOME, CMD_END, CMD_PGUP, CMD_PGDN          ; Home End PgUp PgDn
+01:1A8E CC13
+01:1A90 FF13
+01:1A92 0814
+01:1A94 9C10            	  1680:   .word NOP_CMD, CMD_DEL, NOP_CMD, NOP_CMD             ; Ins Del
+01:1A96 9913
+01:1A98 9C10
+01:1A9A 9C10
+01:1A9C 9C10            	  1681:   .word NOP_CMD, NOP_CMD, NOP_CMD, NOP_CMD
+01:1A9E 9C10
+01:1AA0 9C10
+01:1AA2 9C10
+01:1AA4 F819            	  1682:   .word CMD_HELP, CMD_LIST, CMD_NEWREC, CMD_FIND       ; F1-F4
+01:1AA6 7815
+01:1AA8 2114
+01:1AAA 3114
+01:1AAC 6214            	  1683:   .word CMD_FINDAG, CMD_SORT, NOP_CMD, CMD_DELREC      ; F5-F8
+01:1AAE C314
+01:1AB0 9C10
+01:1AB2 2414
+01:1AB4 9C10            	  1684:   .word NOP_CMD, CMD_QUIT, NOP_CMD, NOP_CMD            ; F9-F12
+01:1AB6 1618
+01:1AB8 9C10
+01:1ABA 9C10
+                        	  1685: KTAB:
+01:1ABC 53              	  1686:   .byte 'S'
+01:1ABD 2717            	  1687:   .word CMD_SAVE
+01:1ABF 41              	  1688:   .byte 'A'
+01:1AC0 2C17            	  1689:   .word CMD_SAVEAS
+01:1AC2 4F              	  1690:   .byte 'O'
+01:1AC3 2F18            	  1691:   .word CMD_OPEN
+01:1AC5 4E              	  1692:   .byte 'N'
+01:1AC6 3519            	  1693:   .word CMD_NEWFILE
+01:1AC8 58              	  1694:   .byte 'X'
+01:1AC9 0C18            	  1695:   .word CMD_SAVEX
+01:1ACB 44              	  1696:   .byte 'D'
+01:1ACC 0C18            	  1697:   .word CMD_SAVEX
+01:1ACE 51              	  1698:   .byte 'Q'
+01:1ACF 1618            	  1699:   .word CMD_QUIT
+01:1AD1 00              	  1700:   .byte 0
+                        	  1701: 
+                        	  1702: DEFNF       = 7
+                        	  1703: DEFFORM:                 ; names (10 each) then widths
+01:1AD2 4E414D4520202020	  1704:   .byte "NAME      ADDRESS   CITY      PHONE     EMAIL     BIRTHDAY  NOTES     "
+01:1ADA 2020414444524553
+01:1AE2 5320202043495459
+01:1AEA 2020202020205048
+01:1AF2 4F4E452020202020
+01:1AFA 454D41494C202020
+01:1B02 2020424952544844
+01:1B0A 415920204E4F5445
+01:1B12 532020202020
+01:1B18 2020202020202020	  1705:   .byte "          "
+01:1B20 2020
+01:1B22 18              	  1706: DEFWID:     .byte 24, 28, 20, 16, 28, 10, 28, 1
+01:1B23 1C
+01:1B24 14
+01:1B25 10
+01:1B26 1C
+01:1B27 0A
+01:1B28 1C
+01:1B29 01
+                        	  1707: DEFFORM_L   = DEFWID+8-DEFFORM
+01:1B2A 424F464C        	  1708: F_MAGIC:    .byte "BOFL",1
+01:1B2E 01
+                        	  1709: 
+01:1B2F 4D494E4956494320	  1710: M_HELLO:    .byte "MINIVIC FILE 1.0  -  ^J OR F1 = HELP",0
+01:1B37 46494C4520312E30
+01:1B3F 20202D20205E4A20
+01:1B47 4F52204631203D20
+01:1B4F 48454C50
+01:1B53 00
+01:1B54 5E4A2048454C5020	  1711: M_HINT:     .byte "^J HELP ^KS SAVE ^KO OPEN ^KN NEW FORM",0
+01:1B5C 5E4B532053415645
+01:1B64 205E4B4F204F5045
+01:1B6C 4E205E4B4E204E45
+01:1B74 5720464F524D
+01:1B7A 00
+01:1B7B 5E4B202053205341	  1712: M_HK:       .byte "^K  S SAVE  A SAVE AS  O OPEN  N NEW  X Q",0
+01:1B83 5645202041205341
+01:1B8B 564520415320204F
+01:1B93 204F50454E20204E
+01:1B9B 204E455720205820
+01:1BA3 51
+01:1BA4 00
+01:1BA5 5047555020504744	  1713: M_KEYS:     .byte "PGUP PGDN CARD  F3 NEW  F8 DEL  F2 LIST",0
+01:1BAD 4E20434152442020
+01:1BB5 4633204E45572020
+01:1BBD 46382044454C2020
+01:1BC5 4632204C495354
+01:1BCC 00
+01:1BCD 46342046494E4420	  1714: M_KEYS2:    .byte "F4 FIND  F5 AGAIN  F6 SORT BY THIS FIELD",0
+01:1BD5 2046352041474149
+01:1BDD 4E2020463620534F
+01:1BE5 5254204259205448
+01:1BED 4953204649454C44
+01:1BF5 00
+01:1BF6 4152524F57532050	  1715: M_LISTK:    .byte "ARROWS PGUP PGDN, ENTER = THIS CARD",0
+01:1BFE 475550205047444E
+01:1C06 2C20454E54455220
+01:1C0E 3D20544849532043
+01:1C16 415244
+01:1C19 00
+01:1C1A 4E4F20524F4F4D20	  1716: M_FULL:     .byte "NO ROOM FOR MORE CARDS",0
+01:1C22 464F52204D4F5245
+01:1C2A 204341524453
+01:1C30 00
+01:1C31 4E4F5420464F554E	  1717: M_NF:       .byte "NOT FOUND",0
+01:1C39 44
+01:1C3A 00
+01:1C3B 534F52544544    	  1718: M_SORTED:   .byte "SORTED",0
+01:1C41 00
+01:1C42 5344204341524420	  1719: M_SDERR:    .byte "SD CARD ERROR OR NOT A CARD FILE",0
+01:1C4A 4552524F52204F52
+01:1C52 204E4F5420412043
+01:1C5A 4152442046494C45
+01:1C62 00
+01:1C63 5341564544      	  1720: M_SAVED:    .byte "SAVED",0
+01:1C68 00
+01:1C69 4C4F41444544    	  1721: M_LOADED:   .byte "LOADED",0
+01:1C6F 00
+01:1C70 4E4F204652454520	  1722: M_NOSLOT:   .byte "NO FREE PLACE: DELETE A DOCUMENT FIRST",0
+01:1C78 504C4143453A2044
+01:1C80 454C455445204120
+01:1C88 444F43554D454E54
+01:1C90 204649525354
+01:1C96 00
+01:1C97 204F50454E204341	  1723: M_OPEN:     .byte " OPEN CARD FILE",0
+01:1C9F 52442046494C45
+01:1CA6 00
+01:1CA7 4E4F204E414D45  	  1724: M_NONAME:   .byte "NO NAME"
+01:1CAE 43415244        	  1725: M_CARD:     .byte "CARD"
+01:1CB2 464954          	  1726: M_FREE:     .byte "FIT"
+01:1CB5 46494E443A20    	  1727: P_FIND:     .byte "FIND: ",0
+01:1CBB 00
+01:1CBC 534156452041533A	  1728: P_SAVE:     .byte "SAVE AS: ",0
+01:1CC4 20
+01:1CC5 00
+01:1CC6 4649454C44203120	  1729: P_FNAME:    .byte "FIELD 1 NAME (ENTER=END): ",0
+01:1CCE 4E414D452028454E
+01:1CD6 5445523D454E4429
+01:1CDE 3A20
+01:1CE0 00
+01:1CE1 5749445448202831	  1730: P_FWIDTH:   .byte "WIDTH (1-28): ",0
+01:1CE9 2D3238293A20
+01:1CEF 00
+01:1CF0 4142414E444F4E20	  1731: Q_ABANDON:  .byte "ABANDON THE CHANGES (Y/N)?",0
+01:1CF8 544845204348414E
+01:1D00 4745532028592F4E
+01:1D08 293F
+01:1D0A 00
+01:1D0B 44454C4554452054	  1732: Q_DELREC:   .byte "DELETE THIS CARD (Y/N)?",0
+01:1D13 4849532043415244
+01:1D1B 2028592F4E293F
+01:1D22 00
+                        	  1733: 
+                        	  1734: HELPTXT:
+01:1D23 204D494E49564943	  1735:   .byte " MINIVIC FILE  -  COMMANDS",0
+01:1D2B 2046494C4520202D
+01:1D33 2020434F4D4D414E
+01:1D3B 4453
+01:1D3D 00
+01:1D3E 00              	  1736:   .byte "",0
+01:1D3F 4649454C44202020	  1737:   .byte "FIELD   UP DOWN TAB ENTER  (^E ^X)",0
+01:1D47 555020444F574E20
+01:1D4F 54414220454E5445
+01:1D57 522020285E45205E
+01:1D5F 5829
+01:1D61 00
+01:1D62 2020202020202020	  1738:   .byte "        LEFT RIGHT HOME END (^S ^D ^A ^F)",0
+01:1D6A 4C45465420524947
+01:1D72 485420484F4D4520
+01:1D7A 454E4420285E5320
+01:1D82 5E44205E41205E46
+01:1D8A 29
+01:1D8B 00
+01:1D8C 2020202020202020	  1739:   .byte "        TYPE OVER, BKSP, DEL (^G)",0
+01:1D94 54595045204F5645
+01:1D9C 522C20424B53502C
+01:1DA4 2044454C20285E47
+01:1DAC 29
+01:1DAD 00
+01:1DAE 4341524420202020	  1740:   .byte "CARD    PGUP PGDN (^R ^C)",0
+01:1DB6 5047555020504744
+01:1DBE 4E20285E52205E43
+01:1DC6 29
+01:1DC7 00
+01:1DC8 2020202020202020	  1741:   .byte "        ^T FIRST  ^Z LAST",0
+01:1DD0 5E54204649525354
+01:1DD8 20205E5A204C4153
+01:1DE0 54
+01:1DE1 00
+01:1DE2 2020202020202020	  1742:   .byte "        F3 NEW CARD (^N)",0
+01:1DEA 4633204E45572043
+01:1DF2 41524420285E4E29
+01:1DFA 00
+01:1DFB 2020202020202020	  1743:   .byte "        F8 DELETE THE CARD (^Y)",0
+01:1E03 46382044454C4554
+01:1E0B 4520544845204341
+01:1E13 524420285E5929
+01:1E1A 00
+01:1E1B 4C49535420202020	  1744:   .byte "LIST    F2: ONE CARD PER ROW",0
+01:1E23 46323A204F4E4520
+01:1E2B 4341524420504552
+01:1E33 20524F57
+01:1E37 00
+01:1E38 46494E4420202020	  1745:   .byte "FIND    F4 TEXT IN ANY FIELD, F5 AGAIN",0
+01:1E40 4634205445585420
+01:1E48 494E20414E592046
+01:1E50 49454C442C204635
+01:1E58 20414741494E
+01:1E5E 00
+01:1E5F 534F525420202020	  1746:   .byte "SORT    F6 BY THE FIELD OF THE CURSOR",0
+01:1E67 4636204259205448
+01:1E6F 45204649454C4420
+01:1E77 4F46205448452043
+01:1E7F 5552534F52
+01:1E84 00
+01:1E85 46494C4520202020	  1747:   .byte "FILE    ^KS SAVE  ^KA SAVE AS",0
+01:1E8D 5E4B532053415645
+01:1E95 20205E4B41205341
+01:1E9D 5645204153
+01:1EA2 00
+01:1EA3 2020202020202020	  1748:   .byte "        ^KO OPEN  ^KN NEW FORM",0
+01:1EAB 5E4B4F204F50454E
+01:1EB3 20205E4B4E204E45
+01:1EBB 5720464F524D
+01:1EC1 00
+01:1EC2 2020202020202020	  1749:   .byte "        ^KX SAVE AND EXIT",0
+01:1ECA 5E4B582053415645
+01:1ED2 20414E4420455849
+01:1EDA 54
+01:1EDB 00
+01:1EDC 2020202020202020	  1750:   .byte "        ^KQ EXIT WITHOUT SAVING F10",0
+01:1EE4 5E4B512045584954
+01:1EEC 20574954484F5554
+01:1EF4 20534156494E4720
+01:1EFC 463130
+01:1EFF 00
+01:1F00 00              	  1751:   .byte "",0
+01:1F01 555020544F203820	  1752:   .byte "UP TO 8 FIELDS OF 1-28 CHARACTERS",0
+01:1F09 4649454C4453204F
+01:1F11 4620312D32382043
+01:1F19 4841524143544552
+01:1F21 53
+01:1F22 00
+01:1F23 00              	  1753:   .byte "",0
+01:1F24 505245535320414E	  1754:   .byte "PRESS ANY KEY",0
+01:1F2C 59204B4559
+01:1F31 00
+01:1F32 FF              	  1755:   .byte $FF
+                        	  1756: 
+                        	  1757: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; libraries
+                        	  1758: 
+                        	  1759:  .include "lib/keys.asm"
+
+Source: "lib\keys.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   KEYS.ASM  -  key queue on top of the BIOS                  ;
+                        	     4: ;                                                              ;
+                        	     5: ;   The PS/2 board keeps one byte: a byte not read within      ;
+                        	     6: ;   ~1 ms is lost (a lost $F0 turns a release into a second    ;
+                        	     7: ;   press). Two ways in, both on: the CA1 interrupt of the     ;
+                        	     8: ;   keyboard VIA (IRQ -> BIOS -> JMP KB_IRQ at $0FA0) reads    ;
+                        	     9: ;   every byte at once; KB_POLL, called by the long loops,     ;
+                        	    10: ;   does the same if the IRQ line is not there. Assembled      ;
+                        	    11: ;   with -DKB_NOIRQ=1 only the polling is left.                ;
+                        	    12: ;   The keys decoded by the BIOS go into a 32-key queue,       ;
+                        	    13: ;   GETKEY takes them out. KB_EXIT before leaving the app.     ;
+                        	    14: ;   An app that uses the serial line itself defines KB_SERBUF  ;
+                        	    15: ;   (256-byte ring): the received bytes go there, not among    ;
+                        	    16: ;   the keys (JT_CHRIN reads the serial line first: a byte it  ;
+                        	    17: ;   returns while CA1 is still set came from the serial line). ;
+                        	    18: ;   Uses: zp $A0-$A1 ($F0-$F1 with KB_SERBUF), RAM $05C0-$05DF ;
+                        	    19: ;                                                              ;
+                        	    20: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    21: 
+                        	    22: KQ          = $05C0    ; 32-key ring
+                        	    23: KQ_MASK     = $1F
+                        	    24: KQR         = $A0      ; read index
+                        	    25: KQW         = $A1      ; write index
+                        	    26: KB_IFR      = $D18D    ; keyboard VIA: interrupt flags (bit 1 = CA1)
+                        	    27: KB_IER      = $D18E    ;               interrupt enable
+                        	    28: KB_SRR      = $F0      ; serial ring (KB_SERBUF): read index
+                        	    29: KB_SRW      = $F1      ;                          write index
+                        	    30: 
+                        	    31: ; KB_INIT: extended keyboard, empty queue, CA1 interrupt on
+                        	    32: KB_INIT:
+01:1F33 78              	    33:   SEI
+01:1F34 A901            	    34:   LDA #1
+01:1F36 2021FD          	    35:   JSR JT_KB_MODE
+01:1F39 64A0            	    36:   STZ KQR
+01:1F3B 64A1            	    37:   STZ KQW
+01:1F3D 64F0            	    38:   STZ KB_SRR
+01:1F3F 64F1            	    39:   STZ KB_SRW
+                        	    40:  .ifndef KB_NOIRQ
+01:1F41 A94C            	    41:   LDA #$4C               ; JMP KB_IRQ in the RAM vector of the BIOS
+01:1F43 8DA00F          	    42:   STA IRQ_VEC
+01:1F46 A963            	    43:   LDA #<KB_IRQ
+01:1F48 8DA10F          	    44:   STA IRQ_VEC+1
+01:1F4B A91F            	    45:   LDA #>KB_IRQ
+01:1F4D 8DA20F          	    46:   STA IRQ_VEC+2
+01:1F50 A982            	    47:   LDA #$82               ; CA1 interrupt enabled
+01:1F52 8D8ED1          	    48:   STA KB_IER
+01:1F55 58              	    49:   CLI
+                        	    50:  .endif
+01:1F56 60              	    51:   RTS
+                        	    52: 
+                        	    53: ; KB_EXIT: interrupt off again (the BIOS menu works by polling)
+                        	    54: KB_EXIT:
+01:1F57 78              	    55:   SEI
+01:1F58 A902            	    56:   LDA #$02
+01:1F5A 8D8ED1          	    57:   STA KB_IER
+01:1F5D A960            	    58:   LDA #$60               ; RTS
+01:1F5F 8DA00F          	    59:   STA IRQ_VEC
+01:1F62 60              	    60:   RTS
+                        	    61: 
+                        	    62: ; KB_IRQ: called by the BIOS IRQ handler (A, X, Y already saved)
+                        	    63: KB_IRQ:
+                        	    64:  .ifdef KB_SERBUF
+                        	    65:   JMP KB_TAKE            ; the keyboard or the serial line
+                        	    66:  .else
+01:1F63 AD8DD1          	    67:   LDA KB_IFR
+01:1F66 2902            	    68:   AND #$02
+01:1F68 F003            	    69:   BEQ .ki_x
+01:1F6A 207B1F          	    70:   JSR KB_TAKE
+                        	    71: .ki_x:
+01:1F6D 60              	    72:   RTS
+                        	    73:  .endif
+                        	    74: 
+                        	    75: ; KB_POLL: one BIOS poll with the interrupt held off. Keeps A, X, Y and the I flag
+                        	    76: KB_POLL:
+01:1F6E 08              	    77:   PHP
+01:1F6F 78              	    78:   SEI
+01:1F70 48              	    79:   PHA
+01:1F71 DA              	    80:   PHX
+01:1F72 5A              	    81:   PHY
+01:1F73 207B1F          	    82:   JSR KB_TAKE
+01:1F76 7A              	    83:   PLY
+01:1F77 FA              	    84:   PLX
+01:1F78 68              	    85:   PLA
+01:1F79 28              	    86:   PLP
+01:1F7A 60              	    87:   RTS
+                        	    88: 
+                        	    89: ; KB_TAKE: a key from the BIOS goes into the queue (full queue: dropped)
+                        	    90: KB_TAKE:
+                        	    91:  .ifdef KB_SERBUF
+                        	    92: .kt_rx:
+                        	    93:   LDA ACIA_STATUS        ; received bytes first, into their ring
+                        	    94:   AND #$08
+                        	    95:   BEQ .kt_kb
+                        	    96:   LDA ACIA_DATA
+                        	    97:   JSR KB_SERPUT
+                        	    98:   BRA .kt_rx
+                        	    99: .kt_kb:
+                        	   100:   LDA KB_IFR
+                        	   101:   AND #$02
+                        	   102:   BEQ .kt_x
+                        	   103:   JSR JT_CHRIN
+                        	   104:   BCC .kt_x
+                        	   105:   PHA
+                        	   106:   LDA KB_IFR             ; CA1 still set: the BIOS took a serial byte, not the key
+                        	   107:   AND #$02
+                        	   108:   BEQ .kt_key
+                        	   109:   PLA
+                        	   110:   JSR KB_SERPUT
+                        	   111:   BRA .kt_rx
+                        	   112: .kt_key:
+                        	   113:   PLA
+                        	   114:  .else
+01:1F7B 2003FD          	   115:   JSR JT_CHRIN
+01:1F7E 900F            	   116:   BCC .kt_x
+                        	   117:  .endif
+01:1F80 A6A1            	   118:   LDX KQW
+01:1F82 9DC005          	   119:   STA KQ,X
+01:1F85 8A              	   120:   TXA
+01:1F86 1A              	   121:   INC A
+01:1F87 291F            	   122:   AND #KQ_MASK
+01:1F89 C5A0            	   123:   CMP KQR
+01:1F8B F002            	   124:   BEQ .kt_x              ; full
+01:1F8D 85A1            	   125:   STA KQW
+                        	   126: .kt_x:
+01:1F8F 60              	   127:   RTS
+                        	   128: 
+                        	   129:  .ifdef KB_SERBUF
+                        	   130: ; KB_SERPUT: A into the serial ring (full: dropped)
+                        	   131: KB_SERPUT:
+                        	   132:   LDX KB_SRW
+                        	   133:   STA KB_SERBUF,X
+                        	   134:   INX
+                        	   135:   CPX KB_SRR
+                        	   136:   BEQ .ks_x
+                        	   137:   STX KB_SRW
+                        	   138: .ks_x:
+                        	   139:   RTS
+                        	   140: 
+                        	   141: ; SERGET: C=1 and A = next received byte, C=0 none
+                        	   142: SERGET:
+                        	   143:   JSR KB_POLL
+                        	   144:   LDX KB_SRR
+                        	   145:   CPX KB_SRW
+                        	   146:   BEQ .sg_n
+                        	   147:   LDA KB_SERBUF,X
+                        	   148:   INC KB_SRR
+                        	   149:   SEC
+                        	   150:   RTS
+                        	   151: .sg_n:
+                        	   152:   CLC
+                        	   153:   RTS
+                        	   154:  .endif
+                        	   155: 
+                        	   156: ; GETKEY: C=1 and A = key, C=0 queue empty (after one poll). Keeps X, Y
+                        	   157: GETKEY:
+01:1F90 206E1F          	   158:   JSR KB_POLL
+01:1F93 A5A0            	   159:   LDA KQR
+01:1F95 C5A1            	   160:   CMP KQW
+01:1F97 F010            	   161:   BEQ .gk_n
+01:1F99 DA              	   162:   PHX
+01:1F9A AA              	   163:   TAX
+01:1F9B BDC005          	   164:   LDA KQ,X
+01:1F9E 48              	   165:   PHA
+01:1F9F 8A              	   166:   TXA
+01:1FA0 1A              	   167:   INC A
+01:1FA1 291F            	   168:   AND #KQ_MASK
+01:1FA3 85A0            	   169:   STA KQR
+01:1FA5 68              	   170:   PLA
+01:1FA6 FA              	   171:   PLX
+01:1FA7 38              	   172:   SEC
+01:1FA8 60              	   173:   RTS
+                        	   174: .gk_n:
+01:1FA9 18              	   175:   CLC
+01:1FAA 60              	   176:   RTS
+                        	   177: 
+                        	   178: ; WAITKEY: A = next key
+                        	   179: WAITKEY:
+01:1FAB 20901F          	   180:   JSR GETKEY
+01:1FAE 90FB            	   181:   BCC WAITKEY
+01:1FB0 60              	   182:   RTS
+                        	   183: 
+                        	   184: ; KEYREADY: C=1 if a key is waiting in the queue
+                        	   185: KEYREADY:
+01:1FB1 206E1F          	   186:   JSR KB_POLL
+01:1FB4 A5A0            	   187:   LDA KQR
+01:1FB6 C5A1            	   188:   CMP KQW
+01:1FB8 18              	   189:   CLC
+01:1FB9 F001            	   190:   BEQ .kr_x
+01:1FBB 38              	   191:   SEC
+                        	   192: .kr_x:
+01:1FBC 60              	   193:   RTS
+                        	   194: 
+
+Source: "apps\file.asm"
+                        	  1760:  .include "lib/vtext.asm"
+
+Source: "lib\vtext.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   VTEXT.ASM  -  40 x 24 text screen on the TMS9918A          ;
+                        	     4: ;                                                              ;
+                        	     5: ;   BIOS text mode (VDP interrupt off, so the main loop can    ;
+                        	     6: ;   write the VRAM at any time). VT_INIT also builds the       ;
+                        	     7: ;   inverse font: codes $80-$FF = codes $00-$7F inverted,      ;
+                        	     8: ;   used for the cursor, the status bar and the marked block.  ;
+                        	     9: ;   Long loops call KB_POLL (lib/keys.asm).                    ;
+                        	    10: ;   Uses: zp $A2-$A4, RAM $0800-$0BFF only inside VT_INIT      ;
+                        	    11: ;                                                              ;
+                        	    12: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    13: 
+                        	    14: VT_P        = $A2      ; 2 bytes: string pointer
+                        	    15: VT_INV      = $A4      ; ORed to every character of VT_STR ($80 = inverse)
+                        	    16: VT_FONTTMP  = $0800    ; RAM copy of the font (1 KB, only during VT_INIT)
+                        	    17: 
+                        	    18: ; VT_INIT: text mode of the BIOS, inverse font, empty screen
+                        	    19: VT_INIT:
+01:1FBD 2009FD          	    20:   JSR JT_INIT_CRT
+01:1FC0 A900            	    21:   LDA #<VRAM_FONT        ; read patterns 0-127 (1 KB)
+01:1FC2 A200            	    22:   LDX #>VRAM_FONT
+01:1FC4 203120          	    23:   JSR VT_RADDR
+01:1FC7 A200            	    24:   LDX #0                 ; (the VRAM address increases by itself)
+                        	    25: .vi_r0:
+01:1FC9 AD00B0          	    26:   LDA VDP_DATA
+01:1FCC 9D0008          	    27:   STA VT_FONTTMP,X
+01:1FCF E8              	    28:   INX
+01:1FD0 D0F7            	    29:   BNE .vi_r0
+                        	    30: .vi_r1:
+01:1FD2 AD00B0          	    31:   LDA VDP_DATA
+01:1FD5 9D0009          	    32:   STA VT_FONTTMP+$100,X
+01:1FD8 E8              	    33:   INX
+01:1FD9 D0F7            	    34:   BNE .vi_r1
+                        	    35: .vi_r2:
+01:1FDB AD00B0          	    36:   LDA VDP_DATA
+01:1FDE 9D000A          	    37:   STA VT_FONTTMP+$200,X
+01:1FE1 E8              	    38:   INX
+01:1FE2 D0F7            	    39:   BNE .vi_r2
+                        	    40: .vi_r3:
+01:1FE4 AD00B0          	    41:   LDA VDP_DATA
+01:1FE7 9D000B          	    42:   STA VT_FONTTMP+$300,X
+01:1FEA E8              	    43:   INX
+01:1FEB D0F7            	    44:   BNE .vi_r3
+01:1FED A900            	    45:   LDA #<(VRAM_FONT+$400) ; inverted copy at pattern 128
+01:1FEF A204            	    46:   LDX #>(VRAM_FONT+$400)
+01:1FF1 202720          	    47:   JSR VT_WADDR
+01:1FF4 A200            	    48:   LDX #0
+                        	    49: .vi_w0:
+01:1FF6 BD0008          	    50:   LDA VT_FONTTMP,X
+01:1FF9 49FF            	    51:   EOR #$FF
+01:1FFB 8D00B0          	    52:   STA VDP_DATA
+01:1FFE E8              	    53:   INX
+01:1FFF D0F5            	    54:   BNE .vi_w0
+                        	    55: .vi_w1:
+01:2001 BD0009          	    56:   LDA VT_FONTTMP+$100,X
+01:2004 49FF            	    57:   EOR #$FF
+01:2006 8D00B0          	    58:   STA VDP_DATA
+01:2009 E8              	    59:   INX
+01:200A D0F5            	    60:   BNE .vi_w1
+                        	    61: .vi_w2:
+01:200C BD000A          	    62:   LDA VT_FONTTMP+$200,X
+01:200F 49FF            	    63:   EOR #$FF
+01:2011 8D00B0          	    64:   STA VDP_DATA
+01:2014 E8              	    65:   INX
+01:2015 D0F5            	    66:   BNE .vi_w2
+                        	    67: .vi_w3:
+01:2017 BD000B          	    68:   LDA VT_FONTTMP+$300,X
+01:201A 49FF            	    69:   EOR #$FF
+01:201C 8D00B0          	    70:   STA VDP_DATA
+01:201F E8              	    71:   INX
+01:2020 D0F5            	    72:   BNE .vi_w3
+01:2022 64A4            	    73:   STZ VT_INV
+01:2024 4CA720          	    74:   JMP VT_CLS
+                        	    75: 
+                        	    76: ; VT_WADDR: VRAM write address A (lo) / X (hi)
+                        	    77: VT_WADDR:
+01:2027 8D01B0          	    78:   STA VDP_REG
+01:202A 8A              	    79:   TXA
+01:202B 0940            	    80:   ORA #$40
+01:202D 8D01B0          	    81:   STA VDP_REG
+01:2030 60              	    82:   RTS
+                        	    83: 
+                        	    84: ; VT_RADDR: VRAM read address A (lo) / X (hi)
+                        	    85: VT_RADDR:
+01:2031 8D01B0          	    86:   STA VDP_REG
+01:2034 8E01B0          	    87:   STX VDP_REG
+01:2037 60              	    88:   RTS
+                        	    89: 
+                        	    90: ; VT_ROW: write address at column 0 of row A (0-23). Keeps Y
+                        	    91: VT_ROW:
+01:2038 AA              	    92:   TAX
+01:2039 BDBB20          	    93:   LDA VT_ROWLO,X
+01:203C 48              	    94:   PHA
+01:203D BDD320          	    95:   LDA VT_ROWHI,X
+01:2040 AA              	    96:   TAX
+01:2041 68              	    97:   PLA
+01:2042 4C2720          	    98:   JMP VT_WADDR
+                        	    99: 
+                        	   100: ; VT_AT: write address at row A, column X. Keeps Y
+                        	   101: VT_AT:
+01:2045 DA              	   102:   PHX
+01:2046 AA              	   103:   TAX
+01:2047 68              	   104:   PLA
+01:2048 18              	   105:   CLC
+01:2049 7DBB20          	   106:   ADC VT_ROWLO,X
+01:204C 48              	   107:   PHA
+01:204D BDD320          	   108:   LDA VT_ROWHI,X
+01:2050 6900            	   109:   ADC #0
+01:2052 AA              	   110:   TAX
+01:2053 68              	   111:   PLA
+01:2054 4C2720          	   112:   JMP VT_WADDR
+                        	   113: 
+                        	   114: ; VT_REP: writes X times the character A
+                        	   115: VT_REP:
+01:2057 E000            	   116:   CPX #0
+01:2059 F010            	   117:   BEQ .vr_x
+                        	   118: .vr_l:
+01:205B 8D00B0          	   119:   STA VDP_DATA
+01:205E 48              	   120:   PHA
+01:205F 8A              	   121:   TXA
+01:2060 290F            	   122:   AND #$0F
+01:2062 D003            	   123:   BNE .vr_n
+01:2064 206E1F          	   124:   JSR KB_POLL
+                        	   125: .vr_n:
+01:2067 68              	   126:   PLA
+01:2068 CA              	   127:   DEX
+01:2069 D0F0            	   128:   BNE .vr_l
+                        	   129: .vr_x:
+01:206B 60              	   130:   RTS
+                        	   131: 
+                        	   132: ; VT_STR: writes the $00-terminated string at VT_P (ORA VT_INV). Y = characters written
+                        	   133: VT_STR:
+01:206C A000            	   134:   LDY #0
+                        	   135: .vs_l:
+01:206E B1A2            	   136:   LDA (VT_P),Y
+01:2070 F010            	   137:   BEQ .vs_x
+01:2072 05A4            	   138:   ORA VT_INV
+01:2074 8D00B0          	   139:   STA VDP_DATA
+01:2077 C8              	   140:   INY
+01:2078 98              	   141:   TYA
+01:2079 290F            	   142:   AND #$0F
+01:207B D0F1            	   143:   BNE .vs_l
+01:207D 206E1F          	   144:   JSR KB_POLL
+01:2080 80EC            	   145:   BRA .vs_l
+                        	   146: .vs_x:
+01:2082 60              	   147:   RTS
+                        	   148: 
+                        	   149: ; VT_LINE: string A/X (lo/hi) at the current address, then spaces (ORA VT_INV) up to
+                        	   150: ; column 40 of the row. Y = start column on entry
+                        	   151: VT_LINE:
+01:2083 85A2            	   152:   STA VT_P
+01:2085 86A3            	   153:   STX VT_P+1
+01:2087 8CA620          	   154:   STY .vl_c
+01:208A 206C20          	   155:   JSR VT_STR
+01:208D 98              	   156:   TYA
+01:208E 18              	   157:   CLC
+01:208F 6DA620          	   158:   ADC .vl_c
+01:2092 8DA620          	   159:   STA .vl_c
+01:2095 A928            	   160:   LDA #40
+01:2097 38              	   161:   SEC
+01:2098 EDA620          	   162:   SBC .vl_c
+01:209B 9008            	   163:   BCC .vl_x
+01:209D AA              	   164:   TAX
+01:209E A920            	   165:   LDA #' '
+01:20A0 05A4            	   166:   ORA VT_INV
+01:20A2 4C5720          	   167:   JMP VT_REP
+                        	   168: .vl_x:
+01:20A5 60              	   169:   RTS
+                        	   170: .vl_c:
+01:20A6 00              	   171:   .byte 0
+                        	   172: 
+                        	   173: ; VT_CLS: whole screen blank
+                        	   174: VT_CLS:
+01:20A7 A900            	   175:   LDA #<VRAM_NAME
+01:20A9 A208            	   176:   LDX #>VRAM_NAME
+01:20AB 202720          	   177:   JSR VT_WADDR
+01:20AE A004            	   178:   LDY #4                 ; 4 x 240 = 960
+                        	   179: .vc_l:
+01:20B0 A920            	   180:   LDA #' '
+01:20B2 A2F0            	   181:   LDX #240
+01:20B4 205720          	   182:   JSR VT_REP
+01:20B7 88              	   183:   DEY
+01:20B8 D0F6            	   184:   BNE .vc_l
+01:20BA 60              	   185:   RTS
+                        	   186: 
+                        	   187: VT_ROWLO:
+01:20BB 00              	   188:   .byte <(VRAM_NAME+0*40),<(VRAM_NAME+1*40),<(VRAM_NAME+2*40),<(VRAM_NAME+3*40)
+01:20BC 28
+01:20BD 50
+01:20BE 78
+01:20BF A0              	   189:   .byte <(VRAM_NAME+4*40),<(VRAM_NAME+5*40),<(VRAM_NAME+6*40),<(VRAM_NAME+7*40)
+01:20C0 C8
+01:20C1 F0
+01:20C2 18
+01:20C3 40              	   190:   .byte <(VRAM_NAME+8*40),<(VRAM_NAME+9*40),<(VRAM_NAME+10*40),<(VRAM_NAME+11*40)
+01:20C4 68
+01:20C5 90
+01:20C6 B8
+01:20C7 E0              	   191:   .byte <(VRAM_NAME+12*40),<(VRAM_NAME+13*40),<(VRAM_NAME+14*40),<(VRAM_NAME+15*40)
+01:20C8 08
+01:20C9 30
+01:20CA 58
+01:20CB 80              	   192:   .byte <(VRAM_NAME+16*40),<(VRAM_NAME+17*40),<(VRAM_NAME+18*40),<(VRAM_NAME+19*40)
+01:20CC A8
+01:20CD D0
+01:20CE F8
+01:20CF 20              	   193:   .byte <(VRAM_NAME+20*40),<(VRAM_NAME+21*40),<(VRAM_NAME+22*40),<(VRAM_NAME+23*40)
+01:20D0 48
+01:20D1 70
+01:20D2 98
+                        	   194: VT_ROWHI:
+01:20D3 08              	   195:   .byte >(VRAM_NAME+0*40),>(VRAM_NAME+1*40),>(VRAM_NAME+2*40),>(VRAM_NAME+3*40)
+01:20D4 08
+01:20D5 08
+01:20D6 08
+01:20D7 08              	   196:   .byte >(VRAM_NAME+4*40),>(VRAM_NAME+5*40),>(VRAM_NAME+6*40),>(VRAM_NAME+7*40)
+01:20D8 08
+01:20D9 08
+01:20DA 09
+01:20DB 09              	   197:   .byte >(VRAM_NAME+8*40),>(VRAM_NAME+9*40),>(VRAM_NAME+10*40),>(VRAM_NAME+11*40)
+01:20DC 09
+01:20DD 09
+01:20DE 09
+01:20DF 09              	   198:   .byte >(VRAM_NAME+12*40),>(VRAM_NAME+13*40),>(VRAM_NAME+14*40),>(VRAM_NAME+15*40)
+01:20E0 0A
+01:20E1 0A
+01:20E2 0A
+01:20E3 0A              	   199:   .byte >(VRAM_NAME+16*40),>(VRAM_NAME+17*40),>(VRAM_NAME+18*40),>(VRAM_NAME+19*40)
+01:20E4 0A
+01:20E5 0A
+01:20E6 0A
+01:20E7 0B              	   200:   .byte >(VRAM_NAME+20*40),>(VRAM_NAME+21*40),>(VRAM_NAME+22*40),>(VRAM_NAME+23*40)
+01:20E8 0B
+01:20E9 0B
+01:20EA 0B
+                        	   201: 
+
+Source: "apps\file.asm"
+                        	  1761:  .include "lib/num.asm"
+
+Source: "lib\num.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   NUM.ASM  -  16-bit numbers to decimal text                 ;
+                        	     4: ;   Uses: zp $A5-$A9                                           ;
+                        	     5: ;                                                              ;
+                        	     6: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     7: 
+                        	     8: NUM         = $A5      ; 2 bytes: number to convert (destroyed)
+                        	     9: BCD         = $A7      ; 3 bytes: BCD result, $A7 = lowest 2 digits
+                        	    10: 
+                        	    11: ; BIN2BCD: NUM -> BCD (double dabble with decimal mode)
+                        	    12: BIN2BCD:
+01:20EB 206E1F          	    13:   JSR KB_POLL
+01:20EE 64A7            	    14:   STZ BCD
+01:20F0 64A8            	    15:   STZ BCD+1
+01:20F2 64A9            	    16:   STZ BCD+2
+01:20F4 A210            	    17:   LDX #16
+01:20F6 F8              	    18:   SED
+                        	    19: .bb_l:
+01:20F7 06A5            	    20:   ASL NUM
+01:20F9 26A6            	    21:   ROL NUM+1
+01:20FB A5A7            	    22:   LDA BCD
+01:20FD 65A7            	    23:   ADC BCD
+01:20FF 85A7            	    24:   STA BCD
+01:2101 A5A8            	    25:   LDA BCD+1
+01:2103 65A8            	    26:   ADC BCD+1
+01:2105 85A8            	    27:   STA BCD+1
+01:2107 A5A9            	    28:   LDA BCD+2
+01:2109 65A9            	    29:   ADC BCD+2
+01:210B 85A9            	    30:   STA BCD+2
+01:210D CA              	    31:   DEX
+01:210E D0E7            	    32:   BNE .bb_l
+01:2110 D8              	    33:   CLD
+01:2111 60              	    34:   RTS
+                        	    35: 
+                        	    36: ; NUMSTR: NUM -> 5 characters at (VT_P),Y.. with leading spaces (last digit always shown)
+                        	    37: ; Y = first position; on exit Y = position after the number
+                        	    38: NUMSTR:
+01:2112 20EB20          	    39:   JSR BIN2BCD
+01:2115 206E1F          	    40:   JSR KB_POLL            ; (BIN2BCD takes ~600 cycles)
+01:2118 A200            	    41:   LDX #0                 ; X = 1 once a digit is not zero
+01:211A A5A9            	    42:   LDA BCD+2
+01:211C 203A21          	    43:   JSR .ns_dig            ; ten thousands
+01:211F A5A8            	    44:   LDA BCD+1
+01:2121 4A              	    45:   LSR
+01:2122 4A              	    46:   LSR
+01:2123 4A              	    47:   LSR
+01:2124 4A              	    48:   LSR
+01:2125 203A21          	    49:   JSR .ns_dig
+01:2128 A5A8            	    50:   LDA BCD+1
+01:212A 203A21          	    51:   JSR .ns_dig
+01:212D A5A7            	    52:   LDA BCD
+01:212F 4A              	    53:   LSR
+01:2130 4A              	    54:   LSR
+01:2131 4A              	    55:   LSR
+01:2132 4A              	    56:   LSR
+01:2133 203A21          	    57:   JSR .ns_dig
+01:2136 A5A7            	    58:   LDA BCD
+01:2138 A201            	    59:   LDX #1                 ; the last digit is always written
+                        	    60: .ns_dig:
+01:213A 290F            	    61:   AND #$0F
+01:213C D008            	    62:   BNE .ns_nz
+01:213E E000            	    63:   CPX #0
+01:2140 D004            	    64:   BNE .ns_nz
+01:2142 A920            	    65:   LDA #' '
+01:2144 8004            	    66:   BRA .ns_put
+                        	    67: .ns_nz:
+01:2146 A201            	    68:   LDX #1
+01:2148 0930            	    69:   ORA #'0'
+                        	    70: .ns_put:
+01:214A 91A2            	    71:   STA (VT_P),Y
+01:214C C8              	    72:   INY
+01:214D 60              	    73:   RTS
+                        	    74: 
+
+Source: "apps\file.asm"
+                        	  1762:  .include "lib/docs.asm"
+
+Source: "lib\docs.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   DOCS.ASM  -  documents in the SD document area             ;
+                        	     4: ;                                                              ;
+                        	     5: ;   Sector 16384 ($00800000, after the 255 program blocks)     ;
+                        	     6: ;   is the index: +0 "DOCS", +4 version 1, +5 slots (15);      ;
+                        	     7: ;   entry k (1-15) at k*32: +0 type (0 free, 1 text,           ;
+                        	     8: ;   2 sheet, 3 card file),                                     ;
+                        	     9: ;   +1/+2 length, +4..+15 name (12 chars, $00 padded).         ;
+                        	    10: ;   Document k = 40 sectors (20 KB) from sector 16384 + k*40.  ;
+                        	    11: ;   Sectors go through the BIOS (JT_SD_READ / JT_SD_WRITE).    ;
+                        	    12: ;   Uses: zp $AA-$AF, $B8-$BA, RAM $0600-$07FF (index sector)  ;
+                        	    13: ;                                                              ;
+                        	    14: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    15: 
+                        	    16: DOC_IDX     = $0600    ; index sector (512 bytes)
+                        	    17: DOC_BASE    = $4000    ; sector 16384
+                        	    18: DOC_SLOTS   = 15
+                        	    19: DOC_SECTS   = 40       ; sectors per document
+                        	    20: DOC_NAMELEN = 12
+                        	    21: DOC_E       = $AA      ; 2 bytes: pointer to the index entry
+                        	    22: DOC_K       = $AC      ; slot
+                        	    23: DOC_I       = $AD      ; sector inside the document
+                        	    24: DOC_N       = $AE      ; sectors to transfer
+                        	    25: DOC_PG      = $AF      ; RAM page of the transfer
+                        	    26: DOC_T       = $B8      ; document type of the application (1 text, 2 sheet, 3 card file)
+                        	    27: DOC_LEN     = $B9      ; 2 bytes: length for DOC_SETENT
+                        	    28: 
+                        	    29: ; DOC_RDIDX: reads the index; a sector without "DOCS" becomes an empty index. C=1 SD error
+                        	    30: DOC_RDIDX:
+01:214E 206622          	    31:   JSR DOC_LBA0
+01:2151 A200            	    32:   LDX #<DOC_IDX
+01:2153 A006            	    33:   LDY #>DOC_IDX
+01:2155 2018FD          	    34:   JSR JT_SD_READ
+01:2158 B00E            	    35:   BCS .dr_x
+01:215A A203            	    36:   LDX #3
+                        	    37: .dr_m:
+01:215C BD0006          	    38:   LDA DOC_IDX,X
+01:215F DDC022          	    39:   CMP DOC_MAGIC,X
+01:2162 D005            	    40:   BNE .dr_new
+01:2164 CA              	    41:   DEX
+01:2165 10F5            	    42:   BPL .dr_m
+01:2167 18              	    43:   CLC
+                        	    44: .dr_x:
+01:2168 60              	    45:   RTS
+                        	    46: .dr_new:
+01:2169 A200            	    47:   LDX #0
+                        	    48: .dr_z:
+01:216B 9E0006          	    49:   STZ DOC_IDX,X
+01:216E 9E0007          	    50:   STZ DOC_IDX+$100,X
+01:2171 E8              	    51:   INX
+01:2172 D0F7            	    52:   BNE .dr_z
+01:2174 A205            	    53:   LDX #5
+                        	    54: .dr_h:
+01:2176 BDC022          	    55:   LDA DOC_MAGIC,X
+01:2179 9D0006          	    56:   STA DOC_IDX,X
+01:217C CA              	    57:   DEX
+01:217D 10F7            	    58:   BPL .dr_h
+01:217F 18              	    59:   CLC
+01:2180 60              	    60:   RTS
+                        	    61: 
+                        	    62: ; DOC_WRIDX: writes the index. C=1 SD error
+                        	    63: DOC_WRIDX:
+01:2181 206622          	    64:   JSR DOC_LBA0
+01:2184 A200            	    65:   LDX #<DOC_IDX
+01:2186 A006            	    66:   LDY #>DOC_IDX
+01:2188 4C1BFD          	    67:   JMP JT_SD_WRITE
+                        	    68: 
+                        	    69: ; DOC_ENTRY: A = slot (1-15) -> DOC_E = its index entry. Keeps X, Y
+                        	    70: DOC_ENTRY:
+01:218B 85AC            	    71:   STA DOC_K
+01:218D 4A              	    72:   LSR
+01:218E 4A              	    73:   LSR
+01:218F 4A              	    74:   LSR
+01:2190 18              	    75:   CLC
+01:2191 6906            	    76:   ADC #>DOC_IDX
+01:2193 85AB            	    77:   STA DOC_E+1
+01:2195 A5AC            	    78:   LDA DOC_K
+01:2197 0A              	    79:   ASL
+01:2198 0A              	    80:   ASL
+01:2199 0A              	    81:   ASL
+01:219A 0A              	    82:   ASL
+01:219B 0A              	    83:   ASL
+01:219C 85AA            	    84:   STA DOC_E              ; (DOC_IDX is page aligned)
+01:219E 60              	    85:   RTS
+                        	    86: 
+                        	    87: ; DOC_FIND: name of 12 bytes at (DOC_P) and type DOC_T -> C=0 and A = slot, C=1 not found
+                        	    88: DOC_P       = VT_P     ; (shares the string pointer)
+                        	    89: DOC_FIND:
+01:219F A901            	    90:   LDA #1
+                        	    91: .df_k:
+01:21A1 48              	    92:   PHA
+01:21A2 208B21          	    93:   JSR DOC_ENTRY
+01:21A5 A000            	    94:   LDY #0
+01:21A7 B1AA            	    95:   LDA (DOC_E),Y
+01:21A9 C5B8            	    96:   CMP DOC_T
+01:21AB D01A            	    97:   BNE .df_n              ; free or another type
+01:21AD A00B            	    98:   LDY #DOC_NAMELEN-1
+                        	    99: .df_c:
+01:21AF B1A2            	   100:   LDA (DOC_P),Y
+01:21B1 85AD            	   101:   STA DOC_I              ; (temporary)
+01:21B3 C8              	   102:   INY                    ; name in the entry at +4
+01:21B4 C8              	   103:   INY
+01:21B5 C8              	   104:   INY
+01:21B6 C8              	   105:   INY
+01:21B7 B1AA            	   106:   LDA (DOC_E),Y
+01:21B9 C5AD            	   107:   CMP DOC_I
+01:21BB D00A            	   108:   BNE .df_n
+01:21BD 88              	   109:   DEY                    ; back to the previous character
+01:21BE 88              	   110:   DEY
+01:21BF 88              	   111:   DEY
+01:21C0 88              	   112:   DEY
+01:21C1 88              	   113:   DEY
+01:21C2 10EB            	   114:   BPL .df_c
+01:21C4 68              	   115:   PLA
+01:21C5 18              	   116:   CLC
+01:21C6 60              	   117:   RTS
+                        	   118: .df_n:
+01:21C7 68              	   119:   PLA
+01:21C8 1A              	   120:   INC A
+01:21C9 C910            	   121:   CMP #DOC_SLOTS+1
+01:21CB D0D4            	   122:   BNE .df_k
+01:21CD 38              	   123:   SEC
+01:21CE 60              	   124:   RTS
+                        	   125: 
+                        	   126: ; DOC_FREE: C=0 and A = first free slot, C=1 index full
+                        	   127: DOC_FREE:
+01:21CF A901            	   128:   LDA #1
+                        	   129: .dfr_k:
+01:21D1 208B21          	   130:   JSR DOC_ENTRY
+01:21D4 A000            	   131:   LDY #0
+01:21D6 B1AA            	   132:   LDA (DOC_E),Y
+01:21D8 F009            	   133:   BEQ .dfr_y
+01:21DA A5AC            	   134:   LDA DOC_K
+01:21DC 1A              	   135:   INC A
+01:21DD C910            	   136:   CMP #DOC_SLOTS+1
+01:21DF D0F0            	   137:   BNE .dfr_k
+01:21E1 38              	   138:   SEC
+01:21E2 60              	   139:   RTS
+                        	   140: .dfr_y:
+01:21E3 A5AC            	   141:   LDA DOC_K
+01:21E5 18              	   142:   CLC
+01:21E6 60              	   143:   RTS
+                        	   144: 
+                        	   145: ; DOC_SETENT: entry of slot A = type DOC_T, length DOC_LEN, name (DOC_P) (12 bytes)
+                        	   146: DOC_SETENT:
+01:21E7 208B21          	   147:   JSR DOC_ENTRY
+01:21EA A000            	   148:   LDY #0
+01:21EC A5B8            	   149:   LDA DOC_T
+01:21EE 91AA            	   150:   STA (DOC_E),Y
+01:21F0 C8              	   151:   INY
+01:21F1 A5B9            	   152:   LDA DOC_LEN
+01:21F3 91AA            	   153:   STA (DOC_E),Y
+01:21F5 C8              	   154:   INY
+01:21F6 A5BA            	   155:   LDA DOC_LEN+1
+01:21F8 91AA            	   156:   STA (DOC_E),Y
+01:21FA C8              	   157:   INY
+01:21FB A900            	   158:   LDA #0
+01:21FD 91AA            	   159:   STA (DOC_E),Y
+01:21FF A000            	   160:   LDY #0                 ; name: (DOC_P)+0..11 -> entry +4..15
+                        	   161: .dse_n:
+01:2201 B1A2            	   162:   LDA (DOC_P),Y
+01:2203 C8              	   163:   INY
+01:2204 C8              	   164:   INY
+01:2205 C8              	   165:   INY
+01:2206 C8              	   166:   INY
+01:2207 91AA            	   167:   STA (DOC_E),Y
+01:2209 88              	   168:   DEY
+01:220A 88              	   169:   DEY
+01:220B 88              	   170:   DEY
+01:220C C00C            	   171:   CPY #DOC_NAMELEN
+01:220E D0F1            	   172:   BNE .dse_n
+01:2210 60              	   173:   RTS
+                        	   174: 
+                        	   175: ; DOC_SECT: SD_LBA = DOC_BASE + DOC_K*40 + DOC_I
+                        	   176: DOC_SECT:
+01:2211 9C1803          	   177:   STZ SD_LBA+2
+01:2214 9C1903          	   178:   STZ SD_LBA+3
+01:2217 A5AC            	   179:   LDA DOC_K
+01:2219 8D1603          	   180:   STA SD_LBA
+01:221C 9C1703          	   181:   STZ SD_LBA+1
+01:221F 0E1603          	   182:   ASL SD_LBA             ; k*8
+01:2222 2E1703          	   183:   ROL SD_LBA+1
+01:2225 0E1603          	   184:   ASL SD_LBA
+01:2228 2E1703          	   185:   ROL SD_LBA+1
+01:222B 0E1603          	   186:   ASL SD_LBA
+01:222E 2E1703          	   187:   ROL SD_LBA+1
+01:2231 AD1703          	   188:   LDA SD_LBA+1           ; + k*32 = 4 * (k*8)
+01:2234 48              	   189:   PHA
+01:2235 AD1603          	   190:   LDA SD_LBA
+01:2238 48              	   191:   PHA
+01:2239 0E1603          	   192:   ASL SD_LBA
+01:223C 2E1703          	   193:   ROL SD_LBA+1
+01:223F 0E1603          	   194:   ASL SD_LBA
+01:2242 2E1703          	   195:   ROL SD_LBA+1
+01:2245 18              	   196:   CLC
+01:2246 68              	   197:   PLA
+01:2247 6D1603          	   198:   ADC SD_LBA
+01:224A 8D1603          	   199:   STA SD_LBA
+01:224D 68              	   200:   PLA
+01:224E 6D1703          	   201:   ADC SD_LBA+1
+01:2251 8D1703          	   202:   STA SD_LBA+1
+01:2254 18              	   203:   CLC
+01:2255 AD1603          	   204:   LDA SD_LBA
+01:2258 65AD            	   205:   ADC DOC_I
+01:225A 8D1603          	   206:   STA SD_LBA
+01:225D AD1703          	   207:   LDA SD_LBA+1
+01:2260 6940            	   208:   ADC #>DOC_BASE
+01:2262 8D1703          	   209:   STA SD_LBA+1
+01:2265 60              	   210:   RTS
+                        	   211: 
+                        	   212: DOC_LBA0:
+01:2266 9C1603          	   213:   STZ SD_LBA
+01:2269 A940            	   214:   LDA #>DOC_BASE
+01:226B 8D1703          	   215:   STA SD_LBA+1
+01:226E 9C1803          	   216:   STZ SD_LBA+2
+01:2271 9C1903          	   217:   STZ SD_LBA+3
+01:2274 60              	   218:   RTS
+                        	   219: 
+                        	   220: ; DOC_XFER: DOC_K = slot, A = RAM page of the data, X/Y = length (lo/hi), C=0 read, C=1 write
+                        	   221: ; Transfers ceil(length / 512) sectors. C=1 SD error
+                        	   222: DOC_XFER:
+01:2275 85AF            	   223:   STA DOC_PG
+01:2277 08              	   224:   PHP
+01:2278 8A              	   225:   TXA                    ; sectors = (length + 511) / 512
+01:2279 18              	   226:   CLC
+01:227A 69FF            	   227:   ADC #$FF
+01:227C 98              	   228:   TYA
+01:227D 6901            	   229:   ADC #$01
+01:227F 4A              	   230:   LSR
+01:2280 85AE            	   231:   STA DOC_N
+01:2282 64AD            	   232:   STZ DOC_I
+01:2284 28              	   233:   PLP
+01:2285 B017            	   234:   BCS .dx_w
+                        	   235: .dx_r:
+01:2287 A5AD            	   236:   LDA DOC_I
+01:2289 C5AE            	   237:   CMP DOC_N
+01:228B B028            	   238:   BCS .dx_ok
+01:228D 201122          	   239:   JSR DOC_SECT
+01:2290 A200            	   240:   LDX #0
+01:2292 A4AF            	   241:   LDY DOC_PG
+01:2294 2018FD          	   242:   JSR JT_SD_READ
+01:2297 B01D            	   243:   BCS .dx_x
+01:2299 20B722          	   244:   JSR .dx_next
+01:229C 80E9            	   245:   BRA .dx_r
+                        	   246: .dx_w:
+01:229E A5AD            	   247:   LDA DOC_I
+01:22A0 C5AE            	   248:   CMP DOC_N
+01:22A2 B011            	   249:   BCS .dx_ok
+01:22A4 201122          	   250:   JSR DOC_SECT
+01:22A7 A200            	   251:   LDX #0
+01:22A9 A4AF            	   252:   LDY DOC_PG
+01:22AB 201BFD          	   253:   JSR JT_SD_WRITE
+01:22AE B006            	   254:   BCS .dx_x
+01:22B0 20B722          	   255:   JSR .dx_next
+01:22B3 80E9            	   256:   BRA .dx_w
+                        	   257: .dx_ok:
+01:22B5 18              	   258:   CLC
+                        	   259: .dx_x:
+01:22B6 60              	   260:   RTS
+                        	   261: .dx_next:
+01:22B7 E6AD            	   262:   INC DOC_I
+01:22B9 E6AF            	   263:   INC DOC_PG
+01:22BB E6AF            	   264:   INC DOC_PG
+01:22BD 4C6E1F          	   265:   JMP KB_POLL
+                        	   266: 
+                        	   267: DOC_MAGIC:
+01:22C0 444F4353        	   268:   .byte "DOCS",1,DOC_SLOTS
+01:22C4 01
+01:22C5 0F
+                        	   269: 
+
+Source: "apps\file.asm"
+                        	  1763:  .include "lib/ui.asm"
+
+Source: "lib\ui.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   UI.ASM  -  the parts every application shows the same way  ;
+                        	     4: ;                                                              ;
+                        	     5: ;   - PROMPT: a question on row 23, the answer typed after it  ;
+                        	     6: ;   - YESNO:  a Y/N question on row 23                         ;
+                        	     7: ;   - DOC_PICK: the list of the SD documents (open / delete)   ;
+                        	     8: ;   Needs lib/keys, lib/vtext, lib/num, lib/docs.              ;
+                        	     9: ;   Uses: zp $B0-$B7, RAM $02A0-$02C7 (UI_LINE),               ;
+                        	    10: ;         $02D8-$02F7 (UI_BUF)                                 ;
+                        	    11: ;                                                              ;
+                        	    12: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    13: 
+                        	    14: UI_LINE     = $02A0    ; 40 characters: a row being built (the apps may use it too)
+                        	    15: UI_BUF      = $02D8    ; PROMPT answer (31 + $00)
+                        	    16: UI_PTXT     = $B0      ; 2 bytes: question
+                        	    17: UI_PMAX     = $B2      ; longest answer
+                        	    18: UI_PUPC     = $B3      ; 1 = letters in upper case
+                        	    19: UI_PLEN     = $B4      ; answer length
+                        	    20: UI_SEL      = $B5      ; DOC_PICK: slot under the bar
+                        	    21: UI_ROW      = $B6
+                        	    22: UI_ANY      = $B7      ; DOC_PICK: 1 = every type can be opened, 0 = only DOC_T
+                        	    23: 
+                        	    24: ; PROMPT: question A/X on row 23, the answer in UI_BUF (it starts with what is already
+                        	    25: ; there), UI_PMAX characters at most. C=0 and A = length (Enter), C=1 Esc
+                        	    26: PROMPT:
+01:22C6 85B0            	    27:   STA UI_PTXT
+01:22C8 86B1            	    28:   STX UI_PTXT+1
+01:22CA A200            	    29:   LDX #0
+                        	    30: .pr_len:
+01:22CC BDD802          	    31:   LDA UI_BUF,X
+01:22CF F003            	    32:   BEQ .pr_d
+01:22D1 E8              	    33:   INX
+01:22D2 80F8            	    34:   BRA .pr_len
+                        	    35: .pr_d:
+01:22D4 86B4            	    36:   STX UI_PLEN
+                        	    37: .pr_draw:
+01:22D6 A917            	    38:   LDA #23
+01:22D8 203820          	    39:   JSR VT_ROW
+01:22DB 64A4            	    40:   STZ VT_INV
+01:22DD A5B0            	    41:   LDA UI_PTXT
+01:22DF 85A2            	    42:   STA VT_P
+01:22E1 A5B1            	    43:   LDA UI_PTXT+1
+01:22E3 85A3            	    44:   STA VT_P+1
+01:22E5 206C20          	    45:   JSR VT_STR
+01:22E8 84B6            	    46:   STY UI_ROW             ; (column)
+01:22EA A200            	    47:   LDX #0
+                        	    48: .pr_c:
+01:22EC E4B4            	    49:   CPX UI_PLEN
+01:22EE F00B            	    50:   BEQ .pr_cur
+01:22F0 BDD802          	    51:   LDA UI_BUF,X
+01:22F3 8D00B0          	    52:   STA VDP_DATA
+01:22F6 E8              	    53:   INX
+01:22F7 E6B6            	    54:   INC UI_ROW
+01:22F9 80F1            	    55:   BRA .pr_c
+                        	    56: .pr_cur:
+01:22FB A9A0            	    57:   LDA #' '+$80           ; cursor
+01:22FD 8D00B0          	    58:   STA VDP_DATA
+01:2300 E6B6            	    59:   INC UI_ROW
+01:2302 A928            	    60:   LDA #40
+01:2304 38              	    61:   SEC
+01:2305 E5B6            	    62:   SBC UI_ROW
+01:2307 9008            	    63:   BCC .pr_k
+01:2309 F006            	    64:   BEQ .pr_k
+01:230B AA              	    65:   TAX
+01:230C A920            	    66:   LDA #' '
+01:230E 205720          	    67:   JSR VT_REP
+                        	    68: .pr_k:
+01:2311 20AB1F          	    69:   JSR WAITKEY
+01:2314 C90D            	    70:   CMP #K_CR
+01:2316 F034            	    71:   BEQ .pr_ok
+01:2318 C91B            	    72:   CMP #K_ESC
+01:231A F034            	    73:   BEQ .pr_esc
+01:231C C908            	    74:   CMP #K_BS
+01:231E F020            	    75:   BEQ .pr_bs
+01:2320 C920            	    76:   CMP #' '
+01:2322 90ED            	    77:   BCC .pr_k
+01:2324 C97F            	    78:   CMP #$7F
+01:2326 B0E9            	    79:   BCS .pr_k
+01:2328 A6B4            	    80:   LDX UI_PLEN
+01:232A E4B2            	    81:   CPX UI_PMAX
+01:232C B0E3            	    82:   BCS .pr_k
+01:232E A4B3            	    83:   LDY UI_PUPC
+01:2330 F003            	    84:   BEQ .pr_s
+01:2332 205223          	    85:   JSR UI_UPC
+                        	    86: .pr_s:
+01:2335 9DD802          	    87:   STA UI_BUF,X
+01:2338 E8              	    88:   INX
+01:2339 9ED802          	    89:   STZ UI_BUF,X
+01:233C 86B4            	    90:   STX UI_PLEN
+01:233E 8096            	    91:   BRA .pr_draw
+                        	    92: .pr_bs:
+01:2340 A6B4            	    93:   LDX UI_PLEN
+01:2342 F0CD            	    94:   BEQ .pr_k
+01:2344 CA              	    95:   DEX
+01:2345 9ED802          	    96:   STZ UI_BUF,X
+01:2348 86B4            	    97:   STX UI_PLEN
+01:234A 808A            	    98:   BRA .pr_draw
+                        	    99: .pr_ok:
+01:234C A5B4            	   100:   LDA UI_PLEN
+01:234E 18              	   101:   CLC
+01:234F 60              	   102:   RTS
+                        	   103: .pr_esc:
+01:2350 38              	   104:   SEC
+01:2351 60              	   105:   RTS
+                        	   106: 
+                        	   107: ; UI_UPC: lower case letter -> upper case. Keeps X, Y
+                        	   108: UI_UPC:
+01:2352 C961            	   109:   CMP #'a'
+01:2354 9006            	   110:   BCC .uu_x
+01:2356 C97B            	   111:   CMP #'z'+1
+01:2358 B002            	   112:   BCS .uu_x
+01:235A 29DF            	   113:   AND #$DF
+                        	   114: .uu_x:
+01:235C 60              	   115:   RTS
+                        	   116: 
+                        	   117: ; YESNO: question A/X on row 23; C=0 if the answer is Y
+                        	   118: YESNO:
+01:235D DA              	   119:   PHX
+01:235E 48              	   120:   PHA
+01:235F A917            	   121:   LDA #23
+01:2361 203820          	   122:   JSR VT_ROW
+01:2364 64A4            	   123:   STZ VT_INV
+01:2366 68              	   124:   PLA
+01:2367 FA              	   125:   PLX
+01:2368 A000            	   126:   LDY #0
+01:236A 208320          	   127:   JSR VT_LINE
+01:236D 20AB1F          	   128:   JSR WAITKEY
+01:2370 29DF            	   129:   AND #$DF
+01:2372 C959            	   130:   CMP #'Y'
+01:2374 F002            	   131:   BEQ .yn_y
+01:2376 38              	   132:   SEC
+01:2377 60              	   133:   RTS
+                        	   134: .yn_y:
+01:2378 18              	   135:   CLC
+01:2379 60              	   136:   RTS
+                        	   137: 
+                        	   138: ; DOC_PICK: whole-screen list of the documents; arrows (^E ^X) choose, Enter opens,
+                        	   139: ; Del (^G) deletes after a question, Esc goes back. A/X = title.
+                        	   140: ; Enter on a free slot, or (UI_ANY = 0) on a document of another type, does nothing.
+                        	   141: ; C=0 and A = slot to open (index in DOC_IDX), C=1 and A=0 back, C=1 and A=$FF SD error.
+                        	   142: ; The caller redraws its screen afterwards.
+                        	   143: DOC_PICK:
+01:237A 85B0            	   144:   STA UI_PTXT
+01:237C 86B1            	   145:   STX UI_PTXT+1
+01:237E 204E21          	   146:   JSR DOC_RDIDX
+01:2381 9003            	   147:   BCC .dp_ok
+01:2383 A9FF            	   148:   LDA #$FF
+01:2385 60              	   149:   RTS
+                        	   150: .dp_ok:
+01:2386 A901            	   151:   LDA #1
+01:2388 85B5            	   152:   STA UI_SEL
+01:238A 20A720          	   153:   JSR VT_CLS
+                        	   154: .dp_draw:
+01:238D A900            	   155:   LDA #0
+01:238F 203820          	   156:   JSR VT_ROW
+01:2392 A980            	   157:   LDA #$80
+01:2394 85A4            	   158:   STA VT_INV
+01:2396 A5B0            	   159:   LDA UI_PTXT
+01:2398 A6B1            	   160:   LDX UI_PTXT+1
+01:239A A000            	   161:   LDY #0
+01:239C 208320          	   162:   JSR VT_LINE
+01:239F A901            	   163:   LDA #1
+01:23A1 85B6            	   164:   STA UI_ROW
+                        	   165: .dp_r:
+01:23A3 204624          	   166:   JSR DP_ROW
+01:23A6 E6B6            	   167:   INC UI_ROW
+01:23A8 A5B6            	   168:   LDA UI_ROW
+01:23AA C910            	   169:   CMP #DOC_SLOTS+1
+01:23AC D0F5            	   170:   BNE .dp_r
+01:23AE A916            	   171:   LDA #22
+01:23B0 203820          	   172:   JSR VT_ROW
+01:23B3 64A4            	   173:   STZ VT_INV
+01:23B5 A920            	   174:   LDA #<DP_KEYS
+01:23B7 A225            	   175:   LDX #>DP_KEYS
+01:23B9 A000            	   176:   LDY #0
+01:23BB 208320          	   177:   JSR VT_LINE
+01:23BE A917            	   178:   LDA #23
+01:23C0 203820          	   179:   JSR VT_ROW
+01:23C3 A920            	   180:   LDA #' '
+01:23C5 A228            	   181:   LDX #40
+01:23C7 205720          	   182:   JSR VT_REP
+                        	   183: .dp_k:
+01:23CA 20AB1F          	   184:   JSR WAITKEY
+01:23CD C91B            	   185:   CMP #K_ESC
+01:23CF F036            	   186:   BEQ .dp_x
+01:23D1 C980            	   187:   CMP #K_UP
+01:23D3 F01A            	   188:   BEQ .dp_up
+01:23D5 C905            	   189:   CMP #'E'-$40
+01:23D7 F016            	   190:   BEQ .dp_up
+01:23D9 C981            	   191:   CMP #K_DOWN
+01:23DB F01C            	   192:   BEQ .dp_dn
+01:23DD C918            	   193:   CMP #'X'-$40
+01:23DF F018            	   194:   BEQ .dp_dn
+01:23E1 C90D            	   195:   CMP #K_CR
+01:23E3 F04C            	   196:   BEQ .dp_go
+01:23E5 C989            	   197:   CMP #K_DEL
+01:23E7 F025            	   198:   BEQ .dp_del
+01:23E9 C907            	   199:   CMP #'G'-$40
+01:23EB F021            	   200:   BEQ .dp_del
+01:23ED 80DB            	   201:   BRA .dp_k
+                        	   202: .dp_up:
+01:23EF C6B5            	   203:   DEC UI_SEL
+01:23F1 D09A            	   204:   BNE .dp_draw
+01:23F3 A90F            	   205:   LDA #DOC_SLOTS
+01:23F5 85B5            	   206:   STA UI_SEL
+01:23F7 8094            	   207:   BRA .dp_draw
+                        	   208: .dp_dn:
+01:23F9 E6B5            	   209:   INC UI_SEL
+01:23FB A5B5            	   210:   LDA UI_SEL
+01:23FD C910            	   211:   CMP #DOC_SLOTS+1
+01:23FF D08C            	   212:   BNE .dp_draw
+01:2401 A901            	   213:   LDA #1
+01:2403 85B5            	   214:   STA UI_SEL
+01:2405 8086            	   215:   BRA .dp_draw
+                        	   216: .dp_x:
+01:2407 A900            	   217:   LDA #0
+01:2409 38              	   218:   SEC
+01:240A 60              	   219:   RTS
+                        	   220: .dp_rd:
+01:240B 4C8D23          	   221:   JMP .dp_draw
+                        	   222: .dp_del:
+01:240E A5B5            	   223:   LDA UI_SEL
+01:2410 208B21          	   224:   JSR DOC_ENTRY
+01:2413 B2AA            	   225:   LDA (DOC_E)
+01:2415 F0B3            	   226:   BEQ .dp_k
+01:2417 A941            	   227:   LDA #<DP_QDEL
+01:2419 A225            	   228:   LDX #>DP_QDEL
+01:241B 205D23          	   229:   JSR YESNO
+01:241E B0EB            	   230:   BCS .dp_rd
+01:2420 A5B5            	   231:   LDA UI_SEL
+01:2422 208B21          	   232:   JSR DOC_ENTRY
+01:2425 A900            	   233:   LDA #0
+01:2427 92AA            	   234:   STA (DOC_E)
+01:2429 208121          	   235:   JSR DOC_WRIDX
+01:242C 90DD            	   236:   BCC .dp_rd
+01:242E A9FF            	   237:   LDA #$FF
+01:2430 60              	   238:   RTS
+                        	   239: .dp_go:
+01:2431 A5B5            	   240:   LDA UI_SEL
+01:2433 208B21          	   241:   JSR DOC_ENTRY
+01:2436 B2AA            	   242:   LDA (DOC_E)
+01:2438 F090            	   243:   BEQ .dp_k
+01:243A A6B7            	   244:   LDX UI_ANY
+01:243C D004            	   245:   BNE .dp_open
+01:243E C5B8            	   246:   CMP DOC_T
+01:2440 D088            	   247:   BNE .dp_k
+                        	   248: .dp_open:
+01:2442 A5B5            	   249:   LDA UI_SEL
+01:2444 18              	   250:   CLC
+01:2445 60              	   251:   RTS
+                        	   252: 
+                        	   253: ; DP_ROW: row UI_ROW+1 = slot UI_ROW: number, name, type, length
+                        	   254: DP_ROW:
+01:2446 A227            	   255:   LDX #39
+01:2448 A920            	   256:   LDA #' '
+                        	   257: .dr_b:
+01:244A 9DA002          	   258:   STA UI_LINE,X
+01:244D CA              	   259:   DEX
+01:244E 10FA            	   260:   BPL .dr_b
+01:2450 A5B6            	   261:   LDA UI_ROW
+01:2452 C90A            	   262:   CMP #10
+01:2454 9007            	   263:   BCC .dr_1
+01:2456 A231            	   264:   LDX #'1'
+01:2458 8EA102          	   265:   STX UI_LINE+1
+01:245B E90A            	   266:   SBC #10
+                        	   267: .dr_1:
+01:245D 0930            	   268:   ORA #'0'
+01:245F 8DA202          	   269:   STA UI_LINE+2
+01:2462 A5B6            	   270:   LDA UI_ROW
+01:2464 208B21          	   271:   JSR DOC_ENTRY
+01:2467 B2AA            	   272:   LDA (DOC_E)
+01:2469 D00D            	   273:   BNE .dr_u
+01:246B A206            	   274:   LDX #6
+                        	   275: .dr_e:
+01:246D BDEC24          	   276:   LDA DP_EMPTY,X
+01:2470 9DA502          	   277:   STA UI_LINE+5,X
+01:2473 CA              	   278:   DEX
+01:2474 10F7            	   279:   BPL .dr_e
+01:2476 804C            	   280:   BRA .dr_o
+                        	   281: .dr_u:
+01:2478 0A              	   282:   ASL                    ; type name (1 TEXT, 2 SHEET, 3 FILE, 4 CODE, other ????)
+01:2479 0A              	   283:   ASL
+01:247A 0A              	   284:   ASL
+01:247B C928            	   285:   CMP #DP_TYPES_END-DP_TYPES
+01:247D 9002            	   286:   BCC .dr_t
+01:247F A900            	   287:   LDA #0
+                        	   288: .dr_t:
+01:2481 AA              	   289:   TAX
+01:2482 A000            	   290:   LDY #0
+                        	   291: .dr_tl:
+01:2484 BDF824          	   292:   LDA DP_TYPES,X
+01:2487 99B302          	   293:   STA UI_LINE+19,Y
+01:248A E8              	   294:   INX
+01:248B C8              	   295:   INY
+01:248C C005            	   296:   CPY #5
+01:248E D0F4            	   297:   BNE .dr_tl
+01:2490 A004            	   298:   LDY #4
+01:2492 A200            	   299:   LDX #0
+                        	   300: .dr_n:
+01:2494 B1AA            	   301:   LDA (DOC_E),Y
+01:2496 F009            	   302:   BEQ .dr_l
+01:2498 9DA502          	   303:   STA UI_LINE+5,X
+01:249B C8              	   304:   INY
+01:249C E8              	   305:   INX
+01:249D E00C            	   306:   CPX #DOC_NAMELEN
+01:249F D0F3            	   307:   BNE .dr_n
+                        	   308: .dr_l:
+01:24A1 A001            	   309:   LDY #1
+01:24A3 B1AA            	   310:   LDA (DOC_E),Y
+01:24A5 85A5            	   311:   STA NUM
+01:24A7 C8              	   312:   INY
+01:24A8 B1AA            	   313:   LDA (DOC_E),Y
+01:24AA 85A6            	   314:   STA NUM+1
+01:24AC A9A0            	   315:   LDA #<UI_LINE
+01:24AE 85A2            	   316:   STA VT_P
+01:24B0 A902            	   317:   LDA #>UI_LINE
+01:24B2 85A3            	   318:   STA VT_P+1
+01:24B4 A01A            	   319:   LDY #26
+01:24B6 201221          	   320:   JSR NUMSTR
+01:24B9 A204            	   321:   LDX #4
+                        	   322: .dr_c:
+01:24BB BDF324          	   323:   LDA DP_BYTES,X
+01:24BE 9DC002          	   324:   STA UI_LINE+32,X
+01:24C1 CA              	   325:   DEX
+01:24C2 10F7            	   326:   BPL .dr_c
+                        	   327: .dr_o:
+01:24C4 A5B6            	   328:   LDA UI_ROW
+01:24C6 1A              	   329:   INC A
+01:24C7 203820          	   330:   JSR VT_ROW
+01:24CA A5B6            	   331:   LDA UI_ROW
+01:24CC C5B5            	   332:   CMP UI_SEL
+01:24CE F004            	   333:   BEQ .dr_i
+01:24D0 A900            	   334:   LDA #0
+01:24D2 8002            	   335:   BRA .dr_w
+                        	   336: .dr_i:
+01:24D4 A980            	   337:   LDA #$80
+                        	   338: .dr_w:
+01:24D6 85A4            	   339:   STA VT_INV
+01:24D8 A200            	   340:   LDX #0
+                        	   341: .dr_wl:
+01:24DA BDA002          	   342:   LDA UI_LINE,X
+01:24DD 05A4            	   343:   ORA VT_INV
+01:24DF 8D00B0          	   344:   STA VDP_DATA
+01:24E2 E8              	   345:   INX
+01:24E3 E028            	   346:   CPX #40
+01:24E5 D0F3            	   347:   BNE .dr_wl
+01:24E7 64A4            	   348:   STZ VT_INV
+01:24E9 4C6E1F          	   349:   JMP KB_POLL
+                        	   350: 
+01:24EC 28454D50545929  	   351: DP_EMPTY:   .byte "(EMPTY)"
+01:24F3 4259544553      	   352: DP_BYTES:   .byte "BYTES"
+01:24F8 3F3F3F3F3F202020	   353: DP_TYPES:   .byte "?????   TEXT    SHEET   FILE    CODE    "
+01:2500 5445585420202020
+01:2508 5348454554202020
+01:2510 46494C4520202020
+01:2518 434F444520202020
+                        	   354: DP_TYPES_END:
+01:2520 454E544552204F50	   355: DP_KEYS:    .byte "ENTER OPEN  DEL DELETE  ESC BACK",0
+01:2528 454E202044454C20
+01:2530 44454C4554452020
+01:2538 455343204241434B
+01:2540 00
+01:2541 44454C4554452054	   356: DP_QDEL:    .byte "DELETE THIS DOCUMENT (Y/N)?",0
+01:2549 48495320444F4355
+01:2551 4D454E542028592F
+01:2559 4E293F
+01:255C 00
+                        	   357: 
+
+Source: "apps\file.asm"
+                        	  1764:  .include "lib/stream.asm"
+
+Source: "lib\stream.asm"
+                        	     1: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	     2: ;                                                              ;
+                        	     3: ;   STREAM.ASM  -  a document written / read byte by byte      ;
+                        	     4: ;                                                              ;
+                        	     5: ;   Through a 512-byte sector buffer, one sector at a time,    ;
+                        	     6: ;   in the slot DOC_K of the document area (lib/docs.asm).     ;
+                        	     7: ;   Uses: zp $E4-$EB, RAM $0800-$09FF (ST_BUF)                 ;
+                        	     8: ;                                                              ;
+                        	     9: ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+                        	    10: 
+                        	    11: ST_BUF      = $0800    ; sector buffer (page aligned)
+                        	    12: ST_POS      = $E4      ; 2 bytes: position in ST_BUF
+                        	    13: ST_SEC      = $E6      ; sector of the document
+                        	    14: ST_LEFT     = $E7      ; 2 bytes: bytes still to read
+                        	    15: ST_ERR      = $E9      ; 1 = SD error or too big
+                        	    16: ST_P        = $EA      ; 2 bytes
+                        	    17: 
+                        	    18: ; ST_WOPEN: start writing the document DOC_K
+                        	    19: ST_WOPEN:
+01:255D 64E4            	    20:   STZ ST_POS
+01:255F 64E5            	    21:   STZ ST_POS+1
+01:2561 64E6            	    22:   STZ ST_SEC
+01:2563 64E9            	    23:   STZ ST_ERR
+01:2565 60              	    24:   RTS
+                        	    25: 
+                        	    26: ; ST_PUT: A to the document. Keeps A, X, Y
+                        	    27: ST_PUT:
+01:2566 48              	    28:   PHA
+01:2567 DA              	    29:   PHX
+01:2568 5A              	    30:   PHY
+01:2569 48              	    31:   PHA
+01:256A A5E4            	    32:   LDA ST_POS
+01:256C 85EA            	    33:   STA ST_P
+01:256E A5E5            	    34:   LDA ST_POS+1
+01:2570 18              	    35:   CLC
+01:2571 6908            	    36:   ADC #>ST_BUF
+01:2573 85EB            	    37:   STA ST_P+1
+01:2575 68              	    38:   PLA
+01:2576 92EA            	    39:   STA (ST_P)
+01:2578 E6E4            	    40:   INC ST_POS
+01:257A D00B            	    41:   BNE .sp_x
+01:257C E6E5            	    42:   INC ST_POS+1
+01:257E A5E5            	    43:   LDA ST_POS+1
+01:2580 C902            	    44:   CMP #2
+01:2582 D003            	    45:   BNE .sp_x
+01:2584 208B25          	    46:   JSR ST_FLUSH
+                        	    47: .sp_x:
+01:2587 7A              	    48:   PLY
+01:2588 FA              	    49:   PLX
+01:2589 68              	    50:   PLA
+01:258A 60              	    51:   RTS
+                        	    52: 
+                        	    53: ; ST_FLUSH: the buffer (ST_POS bytes) to sector ST_SEC, then an empty buffer
+                        	    54: ST_FLUSH:
+01:258B A5E4            	    55:   LDA ST_POS
+01:258D 05E5            	    56:   ORA ST_POS+1
+01:258F F01E            	    57:   BEQ .sf_x
+01:2591 A5E6            	    58:   LDA ST_SEC
+01:2593 C928            	    59:   CMP #DOC_SECTS
+01:2595 B00E            	    60:   BCS .sf_big
+01:2597 85AD            	    61:   STA DOC_I
+01:2599 201122          	    62:   JSR DOC_SECT
+01:259C A200            	    63:   LDX #<ST_BUF
+01:259E A008            	    64:   LDY #>ST_BUF
+01:25A0 201BFD          	    65:   JSR JT_SD_WRITE
+01:25A3 9004            	    66:   BCC .sf_n
+                        	    67: .sf_big:
+01:25A5 A901            	    68:   LDA #1
+01:25A7 85E9            	    69:   STA ST_ERR
+                        	    70: .sf_n:
+01:25A9 E6E6            	    71:   INC ST_SEC
+01:25AB 64E4            	    72:   STZ ST_POS
+01:25AD 64E5            	    73:   STZ ST_POS+1
+                        	    74: .sf_x:
+01:25AF 60              	    75:   RTS
+                        	    76: 
+                        	    77: ; ST_WCLOSE: the last part; DOC_LEN = length. C=1 SD error or more than 20 KB
+                        	    78: ST_WCLOSE:
+01:25B0 A5E6            	    79:   LDA ST_SEC             ; length = sectors * 512 + position
+01:25B2 0A              	    80:   ASL
+01:25B3 18              	    81:   CLC
+01:25B4 65E5            	    82:   ADC ST_POS+1
+01:25B6 85BA            	    83:   STA DOC_LEN+1
+01:25B8 A5E4            	    84:   LDA ST_POS
+01:25BA 85B9            	    85:   STA DOC_LEN
+01:25BC 208B25          	    86:   JSR ST_FLUSH
+01:25BF A5E9            	    87:   LDA ST_ERR
+01:25C1 C901            	    88:   CMP #1                 ; C=1 if ST_ERR
+01:25C3 60              	    89:   RTS
+                        	    90: 
+                        	    91: ; ST_ROPEN: start reading the document DOC_K of DOC_LEN bytes
+                        	    92: ST_ROPEN:
+01:25C4 A5B9            	    93:   LDA DOC_LEN
+01:25C6 85E7            	    94:   STA ST_LEFT
+01:25C8 A5BA            	    95:   LDA DOC_LEN+1
+01:25CA 85E8            	    96:   STA ST_LEFT+1
+01:25CC 64E6            	    97:   STZ ST_SEC
+01:25CE 64E9            	    98:   STZ ST_ERR
+01:25D0 A902            	    99:   LDA #2                 ; (buffer empty: the first ST_GET reads a sector)
+01:25D2 85E5            	   100:   STA ST_POS+1
+01:25D4 64E4            	   101:   STZ ST_POS
+01:25D6 60              	   102:   RTS
+                        	   103: 
+                        	   104: ; ST_GET: A = next byte, C=1 at the end (ST_ERR = 1 if the SD failed). Keeps X, Y
+                        	   105: ST_GET:
+01:25D7 A5E7            	   106:   LDA ST_LEFT
+01:25D9 05E8            	   107:   ORA ST_LEFT+1
+01:25DB F047            	   108:   BEQ .sg_end
+01:25DD DA              	   109:   PHX
+01:25DE 5A              	   110:   PHY
+01:25DF A5E5            	   111:   LDA ST_POS+1
+01:25E1 C902            	   112:   CMP #2
+01:25E3 9016            	   113:   BCC .sg_b
+01:25E5 A5E6            	   114:   LDA ST_SEC             ; next sector
+01:25E7 85AD            	   115:   STA DOC_I
+01:25E9 201122          	   116:   JSR DOC_SECT
+01:25EC A200            	   117:   LDX #<ST_BUF
+01:25EE A008            	   118:   LDY #>ST_BUF
+01:25F0 2018FD          	   119:   JSR JT_SD_READ
+01:25F3 B025            	   120:   BCS .sg_err
+01:25F5 E6E6            	   121:   INC ST_SEC
+01:25F7 64E4            	   122:   STZ ST_POS
+01:25F9 64E5            	   123:   STZ ST_POS+1
+                        	   124: .sg_b:
+01:25FB A5E4            	   125:   LDA ST_POS
+01:25FD 85EA            	   126:   STA ST_P
+01:25FF A5E5            	   127:   LDA ST_POS+1
+01:2601 18              	   128:   CLC
+01:2602 6908            	   129:   ADC #>ST_BUF
+01:2604 85EB            	   130:   STA ST_P+1
+01:2606 E6E4            	   131:   INC ST_POS
+01:2608 D002            	   132:   BNE .sg_d
+01:260A E6E5            	   133:   INC ST_POS+1
+                        	   134: .sg_d:
+01:260C A5E7            	   135:   LDA ST_LEFT
+01:260E D002            	   136:   BNE .sg_l
+01:2610 C6E8            	   137:   DEC ST_LEFT+1
+                        	   138: .sg_l:
+01:2612 C6E7            	   139:   DEC ST_LEFT
+01:2614 B2EA            	   140:   LDA (ST_P)
+01:2616 7A              	   141:   PLY
+01:2617 FA              	   142:   PLX
+01:2618 18              	   143:   CLC
+01:2619 60              	   144:   RTS
+                        	   145: .sg_err:
+01:261A 7A              	   146:   PLY
+01:261B FA              	   147:   PLX
+01:261C A901            	   148:   LDA #1
+01:261E 85E9            	   149:   STA ST_ERR
+01:2620 64E7            	   150:   STZ ST_LEFT
+01:2622 64E8            	   151:   STZ ST_LEFT+1
+                        	   152: .sg_end:
+01:2624 38              	   153:   SEC
+01:2625 60              	   154:   RTS
+                        	   155: 
+
+Source: "apps\file.asm"
+                        	  1765: 
+                        	  1766: CODE_END:
+                        	  1767: 
+
+
+Symbols by name:
+ADDREC                           A:1121
+BCD                              E:00A7
+BIN2BCD                          A:20EB
+CHKMOD                           A:1822
+CMD_BKSP                         A:138F
+CMD_DEL                          A:1399
+CMD_DELREC                       A:1424
+CMD_DOWN                         A:13F1
+CMD_END                          A:13CC
+CMD_FIND                         A:1431
+CMD_FINDAG                       A:1462
+CMD_FIRST                        A:1414
+CMD_HELP                         A:19F8
+CMD_HOME                         A:13C9
+CMD_LAST                         A:1419
+CMD_LEFT                         A:13B5
+CMD_LIST                         A:1578
+CMD_NEWFILE                      A:1935
+CMD_NEWREC                       A:1421
+CMD_OPEN                         A:182F
+CMD_PFXK                         A:109D
+CMD_PGDN                         A:1408
+CMD_PGUP                         A:13FF
+CMD_QUIT                         A:1816
+CMD_RIGHT                        A:13BC
+CMD_SAVE                         A:1727
+CMD_SAVEAS                       A:172C
+CMD_SAVEX                        A:180C
+CMD_SORT                         A:14C3
+CMD_UP                           A:13E5
+CMPREC                           A:1529
+CODE_END                         A:2626
+COLS                             E:0070
+CTRLTAB                          A:1A44
+CUR                              E:0053
+CURPTR                           A:1119
+DATA                             E:3100
+DATA_END                         E:8000
+DEFFORM                          A:1AD2
+DEFFORM_L                        E:0058
+DEFNF                            E:0007
+DEFWID                           A:1B22
+DELREC                           A:1169
+DOCNAME                          E:0270
+DOCSLOT                          E:0066
+DOC_BASE                         E:4000
+DOC_E                            E:00AA
+DOC_ENTRY                        A:218B
+DOC_FIND                         A:219F
+DOC_FREE                         A:21CF
+DOC_I                            E:00AD
+DOC_IDX                          E:0600
+DOC_K                            E:00AC
+DOC_LBA0                         A:2266
+DOC_LEN                          E:00B9
+DOC_MAGIC                        A:22C0
+DOC_N                            E:00AE
+DOC_NAMELEN                      E:000C
+DOC_P                            E:00A2
+DOC_PG                           E:00AF
+DOC_PICK                         A:237A
+DOC_RDIDX                        A:214E
+DOC_SECT                         A:2211
+DOC_SECTS                        E:0028
+DOC_SETENT                       A:21E7
+DOC_SLOTS                        E:000F
+DOC_T                            E:00B8
+DOC_WRIDX                        A:2181
+DOC_XFER                         A:2275
+DOKEY                            A:104C
+DOSAVE                           A:1769
+DP_BYTES                         A:24F3
+DP_EMPTY                         A:24EC
+DP_KEYS                          A:2520
+DP_QDEL                          A:2541
+DP_ROW                           A:2446
+DP_TYPES                         A:24F8
+DP_TYPES_END                     A:2520
+DRAWCARD                         A:11CB
+EXIT                             A:181C
+EXTTAB                           A:1A84
+FILENEW                          A:10D5
+FINDBUF                          E:0280
+FINDMAX                          E:0014
+FLD                              E:0054
+FLDPTR                           A:1361
+FLEN                             E:0065
+FNAME                            E:0210
+FNAMEP                           A:127B
+FOFF                             E:0268
+FORMBAK                          E:0900
+FORMDEF                          A:1923
+FORMSET                          A:10A2
+FPOS                             E:0055
+FWID                             E:0260
+F_MAGIC                          A:1B2A
+GAP                              E:006A
+GAPS                             A:1572
+GETKEY                           A:1F90
+GI                               E:006E
+HELPTXT                          A:1D23
+IDLE                             A:103A
+IRQ_VEC                          E:0FA0
+JT_CHRIN                         E:FD03
+JT_INIT_CRT                      E:FD09
+JT_KB_MODE                       E:FD21
+JT_SD_READ                       E:FD18
+JT_SD_WRITE                      E:FD1B
+JT_SHOW_MENU                     E:FD0F
+KB_EXIT                          A:1F57
+KB_IER                           E:D18E
+KB_IFR                           E:D18D
+KB_INIT                          A:1F33
+KB_IRQ                           A:1F63
+KB_POLL                          A:1F6E
+KB_SRR                           E:00F0
+KB_SRW                           E:00F1
+KB_TAKE                          A:1F7B
+KEYREADY                         A:1FB1
+KQ                               E:05C0
+KQR                              E:00A0
+KQW                              E:00A1
+KQ_MASK                          E:001F
+KTAB                             A:1ABC
+K_BS                             E:0008
+K_CR                             E:000D
+K_DEL                            E:0089
+K_DOWN                           E:0081
+K_ESC                            E:001B
+K_F1                             E:0090
+K_PGDN                           E:0087
+K_PGUP                           E:0086
+K_UP                             E:0080
+LISTHEAD                         A:161E
+LISTROW                          A:1680
+LROWS                            E:0014
+LSEL                             E:0069
+LTOP                             E:0068
+MAIN                             A:1034
+MATCH                            A:1498
+MAXF                             E:0008
+MAXREC                           E:0057
+MAXSLOTS                         E:00FA
+MAXW                             E:001C
+MODF                             E:0056
+MSGLINE                          A:133C
+MSGP                             E:0058
+M_CARD                           A:1CAE
+M_FREE                           A:1CB2
+M_FULL                           A:1C1A
+M_HELLO                          A:1B2F
+M_HINT                           A:1B54
+M_HK                             A:1B7B
+M_KEYS                           A:1BA5
+M_KEYS2                          A:1BCD
+M_LISTK                          A:1BF6
+M_LOADED                         A:1C69
+M_NF                             A:1C31
+M_NONAME                         A:1CA7
+M_NOSLOT                         A:1C70
+M_OPEN                           A:1C97
+M_SAVED                          A:1C63
+M_SDERR                          A:1C42
+M_SORTED                         A:1C3B
+NAMELEN                          E:000C
+NAMEW                            E:000A
+NF                               E:0050
+NOP_CMD                          A:109C
+NREC                             E:0052
+NUM                              E:00A5
+NUMSTR                           A:2112
+ORDER                            E:3000
+P0                               E:0061
+P1                               E:0063
+PREFIX                           E:005A
+PROMPT                           A:22C6
+P_FIND                           A:1CB5
+P_FNAME                          A:1CC6
+P_FWIDTH                         A:1CE1
+P_SAVE                           A:1CBC
+Q_ABANDON                        A:1CF0
+Q_DELREC                         A:1D0B
+RESET                            A:1000
+ROWI                             E:0067
+RP                               E:005B
+RS                               E:0051
+SD_LBA                           E:0316
+SETMSG                           A:135C
+SFLD                             E:006F
+SI                               E:006B
+SJ                               E:006C
+SLOTPTR                          A:10ED
+SMALLNUM                         A:19C8
+SPT                              E:0071
+STATUS                           A:1291
+STMP                             E:006D
+ST_BUF                           E:0800
+ST_ERR                           E:00E9
+ST_FLUSH                         A:258B
+ST_GET                           A:25D7
+ST_LEFT                          E:00E7
+ST_P                             E:00EA
+ST_POS                           E:00E4
+ST_PUT                           A:2566
+ST_ROPEN                         A:25C4
+ST_SEC                           E:00E6
+ST_WCLOSE                        A:25B0
+ST_WOPEN                         A:255D
+T0                               E:005D
+T1                               E:005E
+T2                               E:005F
+T3                               E:0060
+TYPECH                           A:137A
+UI_ANY                           E:00B7
+UI_BUF                           E:02D8
+UI_LINE                          E:02A0
+UI_PLEN                          E:00B4
+UI_PMAX                          E:00B2
+UI_PTXT                          E:00B0
+UI_PUPC                          E:00B3
+UI_ROW                           E:00B6
+UI_SEL                           E:00B5
+UI_UPC                           A:2352
+VDP_DATA                         E:B000
+VDP_REG                          E:B001
+VRAM_FONT                        E:0000
+VRAM_NAME                        E:0800
+VT_AT                            A:2045
+VT_CLS                           A:20A7
+VT_FONTTMP                       E:0800
+VT_INIT                          A:1FBD
+VT_INV                           E:00A4
+VT_LINE                          A:2083
+VT_P                             E:00A2
+VT_RADDR                         A:2031
+VT_REP                           A:2057
+VT_ROW                           A:2038
+VT_ROWHI                         A:20D3
+VT_ROWLO                         A:20BB
+VT_STR                           A:206C
+VT_WADDR                         A:2027
+WAITKEY                          A:1FAB
+YESNO                            A:235D
+
+Symbols by value:
+0000 VRAM_FONT
+0007 DEFNF
+0008 K_BS
+0008 MAXF
+000A NAMEW
+000C DOC_NAMELEN
+000C NAMELEN
+000D K_CR
+000F DOC_SLOTS
+0014 LROWS
+0014 FINDMAX
+001B K_ESC
+001C MAXW
+001F KQ_MASK
+0028 DOC_SECTS
+0050 NF
+0051 RS
+0052 NREC
+0053 CUR
+0054 FLD
+0055 FPOS
+0056 MODF
+0057 MAXREC
+0058 DEFFORM_L
+0058 MSGP
+005A PREFIX
+005B RP
+005D T0
+005E T1
+005F T2
+0060 T3
+0061 P0
+0063 P1
+0065 FLEN
+0066 DOCSLOT
+0067 ROWI
+0068 LTOP
+0069 LSEL
+006A GAP
+006B SI
+006C SJ
+006D STMP
+006E GI
+006F SFLD
+0070 COLS
+0071 SPT
+0080 K_UP
+0081 K_DOWN
+0086 K_PGUP
+0087 K_PGDN
+0089 K_DEL
+0090 K_F1
+00A0 KQR
+00A1 KQW
+00A2 DOC_P
+00A2 VT_P
+00A4 VT_INV
+00A5 NUM
+00A7 BCD
+00AA DOC_E
+00AC DOC_K
+00AD DOC_I
+00AE DOC_N
+00AF DOC_PG
+00B0 UI_PTXT
+00B2 UI_PMAX
+00B3 UI_PUPC
+00B4 UI_PLEN
+00B5 UI_SEL
+00B6 UI_ROW
+00B7 UI_ANY
+00B8 DOC_T
+00B9 DOC_LEN
+00E4 ST_POS
+00E6 ST_SEC
+00E7 ST_LEFT
+00E9 ST_ERR
+00EA ST_P
+00F0 KB_SRR
+00F1 KB_SRW
+00FA MAXSLOTS
+0210 FNAME
+0260 FWID
+0268 FOFF
+0270 DOCNAME
+0280 FINDBUF
+02A0 UI_LINE
+02D8 UI_BUF
+0316 SD_LBA
+05C0 KQ
+0600 DOC_IDX
+0800 VRAM_NAME
+0800 VT_FONTTMP
+0800 ST_BUF
+0900 FORMBAK
+0FA0 IRQ_VEC
+1000 RESET
+1034 MAIN
+103A IDLE
+104C DOKEY
+109C NOP_CMD
+109D CMD_PFXK
+10A2 FORMSET
+10D5 FILENEW
+10ED SLOTPTR
+1119 CURPTR
+1121 ADDREC
+1169 DELREC
+11CB DRAWCARD
+127B FNAMEP
+1291 STATUS
+133C MSGLINE
+135C SETMSG
+1361 FLDPTR
+137A TYPECH
+138F CMD_BKSP
+1399 CMD_DEL
+13B5 CMD_LEFT
+13BC CMD_RIGHT
+13C9 CMD_HOME
+13CC CMD_END
+13E5 CMD_UP
+13F1 CMD_DOWN
+13FF CMD_PGUP
+1408 CMD_PGDN
+1414 CMD_FIRST
+1419 CMD_LAST
+1421 CMD_NEWREC
+1424 CMD_DELREC
+1431 CMD_FIND
+1462 CMD_FINDAG
+1498 MATCH
+14C3 CMD_SORT
+1529 CMPREC
+1572 GAPS
+1578 CMD_LIST
+161E LISTHEAD
+1680 LISTROW
+1727 CMD_SAVE
+172C CMD_SAVEAS
+1769 DOSAVE
+180C CMD_SAVEX
+1816 CMD_QUIT
+181C EXIT
+1822 CHKMOD
+182F CMD_OPEN
+1923 FORMDEF
+1935 CMD_NEWFILE
+19C8 SMALLNUM
+19F8 CMD_HELP
+1A44 CTRLTAB
+1A84 EXTTAB
+1ABC KTAB
+1AD2 DEFFORM
+1B22 DEFWID
+1B2A F_MAGIC
+1B2F M_HELLO
+1B54 M_HINT
+1B7B M_HK
+1BA5 M_KEYS
+1BCD M_KEYS2
+1BF6 M_LISTK
+1C1A M_FULL
+1C31 M_NF
+1C3B M_SORTED
+1C42 M_SDERR
+1C63 M_SAVED
+1C69 M_LOADED
+1C70 M_NOSLOT
+1C97 M_OPEN
+1CA7 M_NONAME
+1CAE M_CARD
+1CB2 M_FREE
+1CB5 P_FIND
+1CBC P_SAVE
+1CC6 P_FNAME
+1CE1 P_FWIDTH
+1CF0 Q_ABANDON
+1D0B Q_DELREC
+1D23 HELPTXT
+1F33 KB_INIT
+1F57 KB_EXIT
+1F63 KB_IRQ
+1F6E KB_POLL
+1F7B KB_TAKE
+1F90 GETKEY
+1FAB WAITKEY
+1FB1 KEYREADY
+1FBD VT_INIT
+2027 VT_WADDR
+2031 VT_RADDR
+2038 VT_ROW
+2045 VT_AT
+2057 VT_REP
+206C VT_STR
+2083 VT_LINE
+20A7 VT_CLS
+20BB VT_ROWLO
+20D3 VT_ROWHI
+20EB BIN2BCD
+2112 NUMSTR
+214E DOC_RDIDX
+2181 DOC_WRIDX
+218B DOC_ENTRY
+219F DOC_FIND
+21CF DOC_FREE
+21E7 DOC_SETENT
+2211 DOC_SECT
+2266 DOC_LBA0
+2275 DOC_XFER
+22C0 DOC_MAGIC
+22C6 PROMPT
+2352 UI_UPC
+235D YESNO
+237A DOC_PICK
+2446 DP_ROW
+24EC DP_EMPTY
+24F3 DP_BYTES
+24F8 DP_TYPES
+2520 DP_TYPES_END
+2520 DP_KEYS
+2541 DP_QDEL
+255D ST_WOPEN
+2566 ST_PUT
+258B ST_FLUSH
+25B0 ST_WCLOSE
+25C4 ST_ROPEN
+25D7 ST_GET
+2626 CODE_END
+3000 ORDER
+3100 DATA
+4000 DOC_BASE
+8000 DATA_END
+B000 VDP_DATA
+B001 VDP_REG
+D18D KB_IFR
+D18E KB_IER
+FD03 JT_CHRIN
+FD09 JT_INIT_CRT
+FD0F JT_SHOW_MENU
+FD18 JT_SD_READ
+FD1B JT_SD_WRITE
+FD21 JT_KB_MODE

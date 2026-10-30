@@ -1,0 +1,14 @@
+# local paths
+vasm.path
+bios.path
+# local notes and working sheets (in Italian)
+CLAUDE.md
+docs/
+# test bundles and emulator output made by tools/run_test.mjs
+tools/.*.test.mjs
+tools/.asmtest/
+tests/
+# test BIOS and SD: the SD is made by bo6502-SDbuilder, nothing of it is published here
+test/
+tools/make_test_sd.py
+tools/testsd.test.ts
