@@ -349,7 +349,7 @@ Errors: `SYNTAX`, `UNDEFINED SYMBOL`, `DEFINED TWICE`, `ADDRESSING MODE`, `BRANC
 ## 🎵 miniVIC JUKEBOX – music player
 
 The songs of MiniVIC Sound in one program: classical pieces in the public domain and original tunes in the style of the 1980s, played in stereo on the two AY-3-8910 of the miniVIC (six voices).
-It is built in the MiniVIC Sound project, together with the songs; here there is only `bin/jukebox.bin`.
+Its source, the songs and the tools are in [miniVIC_music](https://github.com/Boogs77/miniVIC_music); here there is only `bin/jukebox.bin`.
 Unlike the other applications it uses the **joystick** and the audio chips of the miniVIC, not the keyboard or the SD card, so it runs with any BIOS.
 
 <p>
@@ -388,7 +388,7 @@ apps/         one .asm per application
 lib/          shared modules: interrupt keyboard queue, 40-column text with inverse font,
               scrolling console, numbers, 32-bit fixed point, SD documents and streams,
               prompts and document list, W65C02S opcode table
-bin/          assembled .bin files and listings (jukebox.bin comes from MiniVIC Sound)
+bin/          assembled .bin files and listings (jukebox.bin comes from miniVIC_music)
 screenshots/  taken by the tests
 tools/        test runner, tests, opcode table generator, branch fixer
 ```
