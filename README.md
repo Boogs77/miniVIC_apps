@@ -17,6 +17,7 @@ They are small and essential, but they do real work on a 1 MHz W65C02S with 32 K
 | 🔧 [**miniVIC MON**](#-minivic-mon--machine-language-monitor) | `bin/mon.bin` | TOOL | Machine language monitor in the Supermon style |
 | 💾 [**miniVIC DISK**](#-minivic-disk--sd-card-manager) | `bin/disk.bin` | TOOL | SD card manager: programs and documents |
 | 🛠️ [**miniVIC ASM**](#%EF%B8%8F-minivic-asm--65c02-assembler) | `bin/asm.bin` | TOOL | Two-pass 65C02 assembler |
+| 🎵 [**miniVIC JUKEBOX**](#-minivic-jukebox--music-player) | `bin/jukebox.bin` | APP | Music player: 16 songs on the two AY-3-8910, random play |
 
 Every application is a `.bin` loaded at `$0FD0` and started at `$1000`, like the miniVIC games, and it runs from the SD menu of the BIOS.
 When a program starts, the BIOS sends one line on the serial port with its type and name (`[APP] WRITE`, `[TOOL] MON`, `[GAME] ASTEROIDS`); the screen is never mirrored on the serial port.
@@ -345,6 +346,26 @@ Errors: `SYNTAX`, `UNDEFINED SYMBOL`, `DEFINED TWICE`, `ADDRESSING MODE`, `BRANC
 
 ---
 
+## 🎵 miniVIC JUKEBOX – music player
+
+The songs of MiniVIC Sound in one program: classical pieces in the public domain and original tunes in the style of the 1980s, played in stereo on the two AY-3-8910 of the miniVIC (six voices).
+It is built in the MiniVIC Sound project, together with the songs; here there is only `bin/jukebox.bin`.
+Unlike the other applications it uses the **joystick** and the audio chips of the miniVIC, not the keyboard or the SD card, so it runs with any BIOS.
+
+<p>
+<img src="screenshots/jukebox_list.png" width="420" alt="JUKEBOX: the list">
+<img src="screenshots/jukebox_play.png" width="420" alt="JUKEBOX: a song">
+</p>
+
+| Joystick | List | Playing |
+| :--- | :--- | :--- |
+| up / down | choose a song | |
+| fire | play it; on **RANDOM PLAY**: every song once, in random order, never the same twice in a row; on **EXIT**: back to the BIOS menu | back to the list |
+| right | | next song |
+| left | | play it again |
+
+---
+
 ## 🔧 Build and test
 
 ```powershell
@@ -367,7 +388,7 @@ apps/         one .asm per application
 lib/          shared modules: interrupt keyboard queue, 40-column text with inverse font,
               scrolling console, numbers, 32-bit fixed point, SD documents and streams,
               prompts and document list, W65C02S opcode table
-bin/          assembled .bin files and listings
+bin/          assembled .bin files and listings (jukebox.bin comes from MiniVIC Sound)
 screenshots/  taken by the tests
 tools/        test runner, tests, opcode table generator, branch fixer
 ```
