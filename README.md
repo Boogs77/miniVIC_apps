@@ -1,7 +1,8 @@
 # 🖥️ miniVIC Apps
 
 Office applications in 65C02 assembly for the **miniVIC** (and the **BO6502**), in the spirit of the programs of the VIC-20 years (1980-1983): a text editor, a spreadsheet, a card file, a monitor, an assembler and a few utilities.
-They are small and essential, but they do real work on a 1 MHz W65C02S with 32 KB of RAM, a TMS9918A in 40-column text mode, a PS/2 keyboard and an SD card.
+They are small and essential, but they do real work on a 1 MHz W65C02S with 32 KB of RAM, a TMS9918A in 40-column text mode, a DIN5 keyboard and an SD card.
+The [miniVIC Operation Manual](https://github.com/Boogs77/miniVIC-manual) (English and Italian PDF) has a chapter on every application.
 
 ---
 
@@ -30,7 +31,7 @@ When a program starts, the BIOS sends one line on the serial port with its type 
   - the extended keyboard: arrows, Home/End, PgUp/PgDn, Ins/Del, F1-F12, Ctrl, Alt, Caps Lock;
   - SD sector read and write for every card type (SDSC v1/v2, SDHC/SDXC);
   - the `[TYPE] Name` serial line.
-- A PS/2 keyboard, US layout.
+- A DIN5 (AT) keyboard with the US layout; a PS/2 keyboard works through a passive adapter.
 - An SD card made with [bo6502-SDbuilder](https://github.com/Boogs77/bo6502-SDbuilder), which puts the games and these applications in the same menu. **No SD image is published here.**
 
 ### 📄 Documents on the SD card
